@@ -1,5 +1,8 @@
 # Workflow Design Patterns Implementation
 
+> Legacy note: canonical architecture and design documentation now lives in
+> `docs/architecture.md` and `docs/design-decisions.md`.
+
 This project demonstrates **5 agentic workflow patterns** with a focus on:
 
 - **EVALUATOR-OPTIMIZER** (Pattern #5)

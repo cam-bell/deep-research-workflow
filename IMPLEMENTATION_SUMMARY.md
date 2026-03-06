@@ -1,5 +1,7 @@
 # Implementation Summary
 
+> Legacy note: canonical evaluation guidance now lives in `docs/evaluation.md`.
+
 ## ✅ What Was Implemented
 
 Successfully added **EVALUATOR-OPTIMIZER** and **ROUTING** patterns to the deep research workflow.
