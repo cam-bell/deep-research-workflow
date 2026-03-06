@@ -18,6 +18,26 @@ flowchart TD
     G -->|Revise| F
 ```
 
+## Services And Data Flow View
+
+```mermaid
+flowchart LR
+    User --> UI["Gradio Interface"]
+    UI --> Orchestrator["ResearchManager (Orchestrator)"]
+
+    Orchestrator --> Router["Router Agent"]
+    Orchestrator --> Planner["Planner Agent"]
+    Planner --> SearchAgents["Search Agents (async fan-out)"]
+    SearchAgents --> APIs["Search APIs"]
+
+    SearchAgents --> Writer["Writer Agent"]
+    Writer --> Evaluator["Evaluator Agent"]
+
+    Evaluator --> Memory[("Session Memory (Extension, not currently integrated)")]
+    Evaluator --> Email["SendGrid Email Agent"]
+    Email --> User
+```
+
 ## Agent Responsibilities
 
 - `clarify_agent.py`: asks one context-aware clarifying question per step
@@ -55,3 +75,5 @@ Typed models define handoffs:
 - `ReportEvaluation` (`is_acceptable`, `issues`, `suggestions`, `score`)
 
 These contracts reduce ambiguity and make orchestration behavior auditable.
+
+For pattern-level implementation details, see `workflow-patterns.md`.

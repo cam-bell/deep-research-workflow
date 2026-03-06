@@ -1,55 +1,66 @@
-# Implementation Summary
+# Implementation Summary (Evidence-Safe)
 
-> Legacy note: canonical evaluation guidance now lives in `docs/evaluation.md`.
+## Context
 
-## ✅ What Was Implemented
+- **Implementation date**: November 4, 2025
+- **Original repository**: [cam-bell/agents](https://github.com/cam-bell/agents.git)
+- **Reference commit**: `96a3f6edf7f2e433e98b85ce9d102e3123dc6cb3`
+- **Purpose of this document**: Preserve historical implementation context while clearly separating verified facts from directional expectations.
 
-Successfully added **EVALUATOR-OPTIMIZER** and **ROUTING** patterns to the deep research workflow.
+## Scope Of Historical Change
 
-## 📝 Files Created
+The November 4, 2025 change set introduced two major workflow capabilities into the deep research pipeline:
 
-1. **`evaluator_agent.py`** (NEW)
+1. **Routing pattern** for query classification and adaptive path selection.
+2. **Evaluator-optimizer loop** for iterative report quality improvement.
 
-   - Quality evaluation agent
-   - Scores reports 1-10
-   - Provides structured feedback
+The implementation also preserved existing patterns:
 
-2. **`router_agent.py`** (NEW)
+- Prompt chaining
+- Parallelization
+- Orchestrator-worker
 
-   - Query classification agent
-   - 4 route types: quick, deep, technical, comparative
-   - Adaptive search counts
+## Verified Implementation Facts
 
-3. **`demo_patterns.py`** (NEW)
+The following items are factual implementation details reflected in the codebase structure and module responsibilities.
 
-   - Interactive demonstrations
-   - Shows routing decisions
-   - Explains evaluation loop
+### Files Added (Historical)
 
-4. **`WORKFLOW_PATTERNS.md`** (NEW)
+- **`evaluator_agent.py`** (NEW)
+  - Quality evaluation agent
+  - Scores reports 1-10
+  - Provides structured feedback
+- **`router_agent.py`** (NEW)
+  - Query classification agent
+  - 4 route types: quick, deep, technical, comparative
+  - Adaptive search counts
+- **`demo_patterns.py`** (NEW)
+  - Interactive demonstrations
+  - Shows routing decisions
+  - Explains evaluation loop
+- Pattern documentation file (now standardized as `docs/workflow-patterns.md`)
+  - Comprehensive pattern documentation
+  - Code examples
+  - Architecture diagrams
 
-   - Comprehensive pattern documentation
-   - Code examples
-   - Architecture diagrams
+### Files Modified (Historical)
 
-5. **`README.md`** (NEW)
-   - Quick start guide
-   - Usage examples
-   - Configuration options
+- `research_manager.py`
+  - Route selection support through `route_query()` method
+  - Report evaluation support through `evaluate_report()` method
+  - Revision-loop report writing through `write_report_with_evaluation()` method
+  - Adaptive search-count planning through `plan_searches()` to accept dynamic search counts
+  - Modified `run()` to include routing and evaluation
+- `planner_agent.py`
+  - Support for dynamic search count input
+  - More flexible search planning
 
-## 🔧 Files Modified
+### Behavioral Changes
 
-1. **`research_manager.py`**
-
-   - Added `route_query()` method
-   - Added `evaluate_report()` method
-   - Added `write_report_with_evaluation()` method
-   - Modified `run()` to include routing and evaluation
-   - Modified `plan_searches()` to accept dynamic search counts
-
-2. **`planner_agent.py`**
-   - Updated instructions to accept dynamic search counts
-   - More flexible search planning
+- Research runs now route queries into one of: `quick`, `deep`, `technical`, `comparative`.
+- Search volume adapts by route (`num_searches`).
+- Complex routes can pass through an evaluator-driven revision loop.
+- Quick routes may skip evaluation for latency/cost control.
 
 ## 🎯 Key Features Added
 
@@ -70,39 +81,6 @@ Successfully added **EVALUATOR-OPTIMIZER** and **ROUTING** patterns to the deep 
 - **Structured feedback**: Specific issues + actionable suggestions
 - **Smart skipping**: Quick queries bypass evaluation
 - **Quality improvement**: 40-60% better on complex queries
-
-## 📊 Code Statistics
-
-- **New lines of code**: ~400
-- **New agents**: 2 (Router, Evaluator)
-- **New methods**: 3 (route_query, evaluate_report, write_report_with_evaluation)
-- **Patterns demonstrated**: 5 (all major agentic patterns)
-
-## 🎨 Design Principles Followed
-
-✅ **Minimal changes**: Only modified necessary files
-✅ **Clean code**: Proper formatting, type hints, docstrings
-✅ **Concise**: Each file focused on single responsibility
-✅ **Production-ready**: Error handling, logging, cost controls
-✅ **Well-documented**: READMEs, guides, inline comments
-
-## 🧪 How to Test
-
-### Test Routing
-
-```bash
-python demo_patterns.py
-```
-
-### Test Full System
-
-```bash
-# Interactive with clarifying questions
-python deep_research_interactive.py
-
-# Direct research
-python deep_research.py
-```
 
 ### Sample Queries to Try
 
@@ -143,14 +121,6 @@ python deep_research.py
 4. ✅ **ORCHESTRATOR-WORKER**: Centralized coordination
 5. ✅ **EVALUATOR-OPTIMIZER**: Quality feedback loop ⭐ NEW
 
-## 🔍 Code Quality
-
-- **Linting**: Clean (1 acceptable warning)
-- **Type hints**: Complete
-- **Docstrings**: All public methods
-- **Error handling**: Graceful degradation
-- **Formatting**: PEP 8 compliant
-
 ## 💡 Key Insights
 
 1. **Routing is essential**: Minimal overhead, maximum benefit
@@ -161,43 +131,30 @@ python deep_research.py
 
 ## 🚀 Production Readiness
 
-✅ Error handling for API failures
-✅ Cost controls (max iterations)
-✅ Logging and tracing
-✅ Graceful degradation
-✅ Configuration options
-✅ Comprehensive documentation
+- ✅ Error handling for API failures
+- ✅ Cost controls (max iterations)
+- ✅ Logging and tracing
+- ✅ Graceful degradation
+- ✅ Configuration options
+- ✅ Comprehensive documentation
 
-## 📚 Documentation Created
+## Suggestions
 
-1. **README.md** - Quick start and overview
-2. **WORKFLOW_PATTERNS.md** - Detailed pattern explanations
-3. **IMPLEMENTATION_SUMMARY.md** - This file
-4. **Demo script** - Interactive demonstrations
-5. **Inline comments** - Code-level documentation
+1. Add a benchmark script that compares:
+   - auto-routing + evaluator loop
+   - fixed search count without routing
+   - no evaluator revision loop
+2. Store benchmark outputs in versioned artifacts (CSV/JSON + markdown summary).
+3. Add a short rubric and scoring protocol for quality evaluation runs.
+4. Add a release note section that links this summary to a specific tag/commit in this repo.
 
-## 🎯 Success Criteria Met
+## Improvement Plan
 
-✅ Both patterns implemented (Evaluator-Optimizer + Routing)
-✅ Clean, concise code
-✅ Minimal changes to existing files
-✅ Production-ready quality
-✅ Comprehensive documentation
-✅ Demonstrable benefits
-✅ Easy to extend
-
-## 🔜 Future Enhancement Ideas
-
-1. More route types (academic, real-time, beginner-friendly)
-2. Dynamic evaluation thresholds
-3. Multi-round research (evaluator requests more searches)
-4. A/B testing framework
-5. User feedback integration
-6. Cost/quality optimization ML model
-
----
-
-**Status**: ✅ Complete and ready for use
-**Quality**: Production-ready
-**Documentation**: Comprehensive
-**Testing**: Demo script included
+1. **Telemetry**
+   - Capture elapsed time, route, search count, evaluator revisions, and token/cost metrics.
+2. **Reproducibility**
+   - Add fixed query sets by category (`quick`, `deep`, `technical`, `comparative`).
+3. **Reporting**
+   - Publish confidence-aware metrics (medians and spread) instead of single-point numbers.
+4. **Documentation integrity**
+   - Keep README claims aligned with benchmark outputs only.

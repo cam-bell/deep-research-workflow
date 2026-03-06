@@ -30,6 +30,27 @@ flowchart TD
     H --> I[Final Report]
 ```
 
+## Services And Data Flow
+
+```mermaid
+flowchart LR
+    User --> UI["Gradio Interface"]
+    UI --> Orchestrator["ResearchManager (Orchestrator)"]
+
+    Orchestrator --> Router["Router Agent"]
+    Orchestrator --> Planner["Planner Agent"]
+
+    Planner --> SearchAgents["Search Agents (async fan-out)"]
+    SearchAgents --> APIs["Search APIs"]
+
+    SearchAgents --> Writer["Writer Agent"]
+    Writer --> Evaluator["Evaluator Agent"]
+
+    Evaluator --> Memory[("Session Memory (Extension, not currently integrated)")]
+    Evaluator --> Email["SendGrid Email Agent"]
+    Email --> User
+```
+
 ## Problem
 
 Manual deep research is slow, inconsistent, and hard to scale. Analysts must repeatedly search, synthesize, and validate across sources while balancing speed, quality, and cost.
@@ -79,6 +100,7 @@ Together they provide structured planning, concurrent retrieval, iterative quali
 ├── demo_patterns.py
 └── docs/
     ├── architecture.md
+    ├── workflow-patterns.md
     ├── design-decisions.md
     └── evaluation.md
 ```
@@ -115,8 +137,10 @@ See reproducibility guidance in [docs/evaluation.md](docs/evaluation.md).
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Workflow Patterns Deep Dive](docs/workflow-patterns.md)
 - [Design Decisions](docs/design-decisions.md)
 - [Evaluation](docs/evaluation.md)
+- [Implementation Summary (Historical, Evidence-Safe)](IMPLEMENTATION_SUMMARY.md)
 
 ## Run Locally
 

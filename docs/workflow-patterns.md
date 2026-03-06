@@ -1,7 +1,8 @@
 # Workflow Design Patterns Implementation
 
-> Legacy note: canonical architecture and design documentation now lives in
-> `docs/architecture.md` and `docs/design-decisions.md`.
+This document is the deep-dive reference for the five workflow patterns
+implemented in this project. For system-level views, see
+`docs/architecture.md` and `docs/design-decisions.md`.
 
 This project demonstrates **5 agentic workflow patterns** with a focus on:
 
@@ -234,7 +235,7 @@ query = "Compare React vs Vue vs Angular for enterprise applications"
 ### Standard Research (with interactive clarification)
 
 ```bash
-cd /Users/cameronbell/Projects/agents/2_openai/deep_research_workflow
+cd /Users/cameronbell/Projects/deep-research-workflow
 python deep_research_interactive.py
 ```
 
