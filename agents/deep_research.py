@@ -1,6 +1,7 @@
 import gradio as gr
 from dotenv import load_dotenv
-from research_manager import ResearchManager
+
+from agents.research_manager import ResearchManager
 
 load_dotenv(override=True)
 
@@ -20,4 +21,3 @@ with gr.Blocks(theme=gr.themes.Default(primary_hue="sky")) as ui:
     query_textbox.submit(fn=run, inputs=query_textbox, outputs=report)
 
 ui.launch(inbrowser=True)
-
