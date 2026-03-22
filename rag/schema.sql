@@ -37,3 +37,34 @@ create table if not exists users (
   password_hash text not null,
   created_at timestamptz default now()
 );
+
+create or replace function match_chunks(
+  query_embedding vector(1536),
+  match_count int default 5,
+  filter_source text default null
+)
+returns table (
+  id uuid,
+  content text,
+  source_name text,
+  source_url text,
+  section_title text,
+  similarity float
+)
+language plpgsql
+as $$
+begin
+  return query
+  select
+    c.id,
+    c.content,
+    c.source_name,
+    c.source_url,
+    c.section_title,
+    1 - (c.embedding <=> query_embedding) as similarity
+  from corpus_chunks c
+  where filter_source is null or c.source_name = filter_source
+  order by c.embedding <=> query_embedding
+  limit match_count;
+end;
+$$;
