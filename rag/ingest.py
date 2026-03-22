@@ -178,7 +178,7 @@ SOURCES: dict[str, SourceConfig] = {
     "anthropic-docs": SourceConfig(
         key="anthropic-docs",
         base_url="https://platform.claude.com",
-        start_paths=["docs/en/intro", "docs/en/api", "docs/en/about-claude/models/overview"],
+        start_paths=["docs/en/intro", "docs/en/api", "docs/en/build-with-claude/overview", "docs/en/about-claude/models/overview"],
         source_name="Anthropic API Documentation",
         max_pages=100,
     ),
