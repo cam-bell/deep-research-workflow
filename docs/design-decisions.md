@@ -33,3 +33,44 @@ This explicitly trades off speed/cost for depth/quality based on query character
 ## 6. Documentation Architecture Choice
 
 Documentation is standardized under `/docs` to keep README scan-friendly for recruiters while preserving deeper technical rationale in dedicated files.
+
+## 7. RAG Layer: pgvector over Pinecone/Weaviate
+
+Placeholder — to be completed after Phase 1 with measured rationale.
+
+## 8. Chunking Strategy: 512 tokens, 64-token overlap
+
+Placeholder — to be completed after Phase 1 with before/after 
+RAGAS context recall scores.
+
+## 9. Embedding Model: text-embedding-3-small
+
+Placeholder — to be completed after Phase 1 with cost estimate.
+
+## 10. Hybrid Retrieval: BM25 + pgvector + RRF
+
+Placeholder — to be completed after Phase 1.
+
+## 11. JWT over OAuth2
+
+Placeholder — to be completed after Phase 3.
+
+## 12. React + Vite over Next.js
+
+Placeholder — to be completed after Phase 3.
+
+## 13. Railway over Fly.io/Render
+
+Placeholder — to be completed after Phase 3.
+
+## 14. Two Git Remotes (GitHub + HF Spaces)
+
+Placeholder — to be completed after Phase 3.
+
+## 15. RAGAS over Manual Scoring
+
+Placeholder — to be completed after Phase 2.
+
+## 16. LangFuse over Arize/Helicone
+
+Placeholder — to be completed after Phase 3.
