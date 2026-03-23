@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import re
+import ssl
 import sys
 from collections import deque
 from pathlib import Path
@@ -95,9 +96,11 @@ class SourceConfig(BaseModel):
     start_paths: list[str] = Field(default_factory=list)
     urls: list[str] = Field(default_factory=list)
     redirect_allowed_hosts: list[str] = Field(default_factory=list)
+    redirect_passthrough_hosts: list[str] = Field(default_factory=list)
     blocked_path_substrings: list[str] = Field(default_factory=list)
     allowed_path_prefixes: list[str] = Field(default_factory=list)
     extra_headers: dict[str, str] = Field(default_factory=dict)
+    tls_fallback_strategy: str | None = None
     known_failure_label: str | None = None
 
     model_config = ConfigDict(frozen=True)
@@ -270,11 +273,23 @@ SOURCES: dict[str, SourceConfig] = {
     "netflix-rfcs": SourceConfig(
         key="netflix-rfcs",
         urls=[
-            "https://netflixtechblog.com/",
+            "https://netflixtechblog.com/scaling-global-storytelling-modernizing-localization-analytics-at-netflix-816f47290641",
+            "https://netflixtechblog.com/optimizing-recommendation-systems-with-jdks-vector-api-30d2830401ec",
+            "https://netflixtechblog.com/mount-mayhem-at-netflix-scaling-containers-on-modern-cpus-f3b09b68beac",
+            "https://netflixtechblog.com/mediafm-the-multimodal-ai-foundation-for-media-understanding-at-netflix-e8c28df82e2d",
+            "https://netflixtechblog.com/scaling-llm-post-training-at-netflix-0046f8790194",
+            "https://netflixtechblog.com/automating-rds-postgres-to-aurora-postgres-migration-261ca045447f",
+            "https://netflixtechblog.com/the-ai-evolution-of-graph-search-at-netflix-d416ec5b1151",
+            "https://netflixtechblog.com/how-temporal-powers-reliable-cloud-operations-at-netflix-73c69ccb5953",
+            "https://netflixtechblog.com/netflix-live-origin-41f1b0ad5371",
+            "https://netflixtechblog.com/av1-now-powering-30-of-netflix-streaming-02f592242d80",
+            "https://netflixtechblog.com/supercharging-the-ml-and-ai-development-experience-at-netflix-b2d5b95c63eb",
         ],
         source_name="Engineering RFCs and ADRs (Netflix)",
         max_pages=15,
-        blocked_path_substrings=["/pricing", "/login", "/account", "/tag/", "/author/"],
+        redirect_passthrough_hosts=["medium.com"],
+        blocked_path_substrings=["/pricing", "/login", "/account", "/tag/", "/tagged/", "/author/", "/followers"],
+        tls_fallback_strategy="system_trust_store",
         known_failure_label="environment_blocked_tls",
     ),
     "github-rfcs": SourceConfig(
@@ -563,7 +578,11 @@ def _is_allowed_redirect(requested_url: str, response: httpx.Response, config: S
     hosts = _redirect_chain_hosts(requested_url, response)
     host_changes = sum(1 for left, right in zip(hosts, hosts[1:]) if left != right)
     if host_changes > 1:
-        return False
+        allowed_chain_hosts = config.allowed_hosts | {
+            host.lower() for host in config.redirect_passthrough_hosts
+        }
+        if not all(host in allowed_chain_hosts for host in hosts):
+            return False
     return True
 
 
@@ -608,6 +627,54 @@ def _classify_fetch_error(exc: Exception, config: SourceConfig) -> tuple[str, st
     ):
         return ("environment_blocked", "tls_certificate_verification_failed")
     return None
+
+
+def _is_certificate_verification_error(exc: Exception) -> bool:
+    return (
+        isinstance(exc, (httpx.ConnectError, httpx.ReadError))
+        and "certificate verify failed" in str(exc).lower()
+    )
+
+
+def _build_tls_fallback_context(config: SourceConfig) -> ssl.SSLContext | None:
+    if config.tls_fallback_strategy != "system_trust_store":
+        return None
+
+    try:
+        import truststore
+    except ImportError:
+        logger.warning(
+            "TLS fallback requested but truststore is unavailable source=%s",
+            config.source_name,
+        )
+        return None
+
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+async def _fetch_with_tls_fallback(
+    client: httpx.AsyncClient,
+    url: str,
+    config: SourceConfig,
+) -> httpx.Response | None:
+    verify_context = _build_tls_fallback_context(config)
+    if verify_context is None:
+        return None
+
+    logger.warning(
+        "Retrying fetch with TLS fallback source=%s url=%s strategy=%s",
+        config.source_name,
+        url,
+        config.tls_fallback_strategy,
+    )
+    async with httpx.AsyncClient(
+        headers=dict(client.headers),
+        timeout=client.timeout,
+        verify=verify_context,
+    ) as fallback_client:
+        response = await fallback_client.get(url, follow_redirects=True)
+        response.raise_for_status()
+        return response
 
 
 async def _run_supabase_operation(
@@ -686,6 +753,17 @@ async def _fetch_page(
                 logger.warning("Retrying fetch url=%s attempt=%s", url, attempt)
                 await _sleep_backoff(attempt)
                 continue
+            if _is_certificate_verification_error(exc):
+                try:
+                    response = await _fetch_with_tls_fallback(client, url, config)
+                except httpx.HTTPStatusError:
+                    logger.exception("Failed TLS fallback fetch url=%s", url)
+                    return None
+                except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.TimeoutException):
+                    logger.exception("Failed TLS fallback fetch url=%s", url)
+                else:
+                    if response is not None:
+                        break
             classified = _classify_fetch_error(exc, config)
             if classified is not None:
                 status, detail = classified

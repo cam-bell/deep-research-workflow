@@ -85,3 +85,57 @@ The looser crawl policy increases the risk of wandering into low-value or noisy 
 
 ### What I learned
 I learned that validating `base_url` and `start_paths` is necessary but not sufficient; a crawler can be pointed at the correct site and still fail because its discovery rules are wrong. I also learned that corpus starvation shows up first as a retrieval problem, but the real fix is often in crawl policy and content selection rather than in the retriever. Next time I would instrument acceptance and rejection reasons earlier so I can see crawl starvation before it becomes a larger pipeline issue.
+
+---
+
+## 2026-03-23 — Phase 1
+
+### Ingestion / RFC source split and host-specific crawl controls
+
+### What we were trying to do
+Improve the quality and reliability of the public engineering RFC/ADR corpus by treating Cloudflare, Uber, Netflix, and GitHub as separate crawl targets instead of one aggregated source. The goal was to give each host its own crawl policy so low-quality taxonomy pages and host-specific fetch failures would not contaminate the whole RFC source.
+
+### What happened
+The original aggregated `engineering-rfcs` source behaved inconsistently because each host had different HTML structure, URL patterns, and fetch constraints. Cloudflare was pulling in tag and author pages that would dilute retrieval quality, Uber was failing with `406 Not Acceptable` under the default headers, Netflix was failing before ingestion, and GitHub was working but was mixed into the same coarse config. This made it difficult to tell whether the crawler itself was broken or whether one host was poisoning the aggregate results.
+
+### Root cause
+The source grouping was too coarse. Four different publishing stacks were being handled by one shared config, which meant the crawler could not express host-specific allow rules, blocked paths, or request headers. The failures were not caused by one generic bug; they were caused by heterogeneous source behavior being forced through a single source definition.
+
+### What we changed
+We updated `/Users/cameronbell/Projects/deep-research-workflow/rag/ingest.py` to replace the single `engineering-rfcs` source with four host-specific configs: `cloudflare-rfcs`, `uber-rfcs`, `netflix-rfcs`, and `github-rfcs`. We added source-level controls for `allowed_path_prefixes`, `blocked_path_substrings`, and `extra_headers`, then used them to block Cloudflare `/tag/` and `/author/` pages, constrain Uber crawling to `/blog/`, and send browser-like `Accept` and `Accept-Language` headers to Uber. We expanded `/Users/cameronbell/Projects/deep-research-workflow/tests/test_ingest.py` with source-specific coverage for host-specific URL admission, blocked taxonomy paths, listing-page rejection, and per-host headers.
+
+### Why this fix and not another
+The alternative was to keep one aggregated RFC source and pile on more generic crawler heuristics, but that would have hidden host-specific problems instead of solving them. Splitting the source was the lowest-risk way to keep the ingestion pipeline coherent while preserving the same overall corpus category. There was no practical benefit in pretending the four hosts behaved similarly when the live verification showed the opposite.
+
+### What to watch for
+The split improves diagnosis and control, but it also increases the number of source configs that must be maintained as sites change. Because the RFC hosts no longer share one source definition, eval and reporting code later in the project will need to be conscious of whether they care about per-host names or the broader “Engineering RFCs and ADRs” category. Cloudflare and GitHub may still need additional path noise tuning if new archive or taxonomy routes appear.
+
+### What I learned
+I learned that a heterogeneous source group is often a code smell in ingestion work: if hosts need different fetch behavior, they probably need different configs. I also learned that source-level clarity is worth the extra config surface because it makes live debugging much faster and keeps one bad host from obscuring the health of the others.
+
+---
+
+## 2026-03-23 — Phase 1
+
+### Ingestion / Netflix Tech Blog recovery
+
+### What we were trying to do
+Get Netflix Tech Blog content into the RFC/ADR corpus without weakening global crawler security or silently dropping the source. The goal was to determine whether Netflix was truly unusable in this runtime or whether the problem could be fixed cleanly enough to keep the source in the corpus.
+
+### What happened
+Netflix initially failed with repeated certificate errors, so the ingestion code classified it as `environment_blocked` with `tls_certificate_verification_failed` and exited cleanly with zero chunks inserted. After further investigation, we found that the failure was no longer purely transport-related: once the TLS path was improved, the root `https://netflixtechblog.com/` page fetched successfully but contained only about 17 words and behaved like a thin Medium publication shell, so `_parse_document()` correctly skipped it before chunking. We also tested `https://netflixtechblog.medium.com/`, but that returned `403 Forbidden` even after the trust-store fallback, so it was not a better crawl entrypoint.
+
+### Root cause
+There were two separate root causes over time. First, the Python/httpx runtime could not verify the certificate path served by `netflixtechblog.com`, which blocked fetches entirely. Second, once fetches succeeded, the configured seed URL was still wrong for this ingestion pipeline: the homepage was a publication landing page rather than a substantive article page, so it never met the parser’s content threshold and never produced useful discovered links for the crawl queue.
+
+### What we changed
+We updated `/Users/cameronbell/Projects/deep-research-workflow/rag/ingest.py` to add a source-local TLS fallback for Netflix using `truststore`, plus `redirect_passthrough_hosts=["medium.com"]` so the `netflixtechblog.com -> medium.com -> netflixtechblog.com` identity redirect chain would not be rejected as out of scope. We added `truststore` to `/Users/cameronbell/Projects/deep-research-workflow/pyproject.toml` and refreshed `/Users/cameronbell/Projects/deep-research-workflow/uv.lock`. We then changed the Netflix source seeds in `/Users/cameronbell/Projects/deep-research-workflow/rag/ingest.py` from the homepage to a curated list of canonical article URLs such as `/scaling-global-storytelling-modernizing-localization-analytics-at-netflix-816f47290641` and `/optimizing-recommendation-systems-with-jdks-vector-api-30d2830401ec`, and tightened Netflix path blocking to include `/tagged/` and `/followers`. We expanded `/Users/cameronbell/Projects/deep-research-workflow/tests/test_ingest.py` to cover certificate-failure recovery, trusted passthrough redirect chains, Netflix article URL admission, and canonical article-link discovery from Netflix article pages.
+
+### Why this fix and not another
+The main alternatives were replacing Netflix with a different publication source, weakening TLS verification, or building a Medium-specific browser automation path. We rejected global TLS weakening because it would lower the crawler’s security bar for every source. We rejected the `netflixtechblog.medium.com` route because it returned `403` in this runtime. We also held off on replacing Netflix because Netflix is still part of the declared corpus and Phase 2 eval assumptions, so a source replacement would create avoidable spec drift. The article-seed approach was chosen because it preserved the intended source while staying within the existing ingestion architecture.
+
+### What to watch for
+Netflix is now operational, but it is still more curated and source-specific than the other documentation sources. The current crawl starts from article-level seeds rather than a clean server-rendered archive, so if Netflix changes how those canonical article URLs behave, the source may need another maintenance pass. The trust-store fallback and Medium passthrough are also source-specific behaviors that should be kept tightly scoped so they do not accidentally broaden redirect handling for unrelated hosts.
+
+### What I learned
+I learned that “the source is blocked” and “the source is unseedable” are different problems, and it is important to separate them before deciding to replace a corpus source. I also learned that a curated article seed list can still be a real crawl if the discovered links are canonicalized and allowed to expand, but it should be documented honestly as a deliberate tradeoff rather than treated like a generic docs crawl.

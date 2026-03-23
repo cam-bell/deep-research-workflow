@@ -11,8 +11,10 @@ from rag.ingest import (
     SourceConfig,
     SourceFetchBlocked,
     _build_client_headers,
+    _build_tls_fallback_context,
     _classify_fetch_error,
     _fetch_page,
+    _fetch_with_tls_fallback,
     _insert_chunk_rows,
     _is_allowed_redirect,
     _is_allowed_url,
@@ -69,6 +71,56 @@ def test_cloudflare_article_urls_are_allowed():
     )
 
 
+def test_netflix_article_urls_are_allowed():
+    config = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=[
+            "https://netflixtechblog.com/scaling-global-storytelling-modernizing-localization-analytics-at-netflix-816f47290641",
+        ],
+        blocked_path_substrings=["/tagged/", "/author/", "/followers"],
+    )
+    assert _is_allowed_url(
+        "https://netflixtechblog.com/optimizing-recommendation-systems-with-jdks-vector-api-30d2830401ec",
+        config,
+    )
+    assert not _is_allowed_url(
+        "https://netflixtechblog.com/tagged/performance",
+        config,
+    )
+
+
+def test_netflix_article_page_discovers_canonical_article_links():
+    config = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=[
+            "https://netflixtechblog.com/scaling-global-storytelling-modernizing-localization-analytics-at-netflix-816f47290641",
+        ],
+        blocked_path_substrings=["/tagged/", "/author/", "/followers"],
+    )
+    paragraph = " ".join(["content"] * 260)
+    page = FetchedPage(
+        url="https://netflixtechblog.com/scaling-global-storytelling-modernizing-localization-analytics-at-netflix-816f47290641",
+        html=(
+            "<html><body><main>"
+            "<h1>Scaling Global Storytelling</h1>"
+            f"<p>{paragraph}</p>"
+            "<a href='https://netflixtechblog.com/optimizing-recommendation-systems-with-jdks-vector-api-30d2830401ec?source=collection_home_page----2615bd06b42e-----0-----------------------------------'>Next</a>"
+            "<a href='https://netflixtechblog.com/mediafm-the-multimodal-ai-foundation-for-media-understanding-at-netflix-e8c28df82e2d?source=collection_home_page----2615bd06b42e-----1-----------------------------------'>Related</a>"
+            "<a href='https://netflixtechblog.com/tagged/performance'>Tag</a>"
+            "<a href='https://netflixtechblog.com/followers'>Followers</a>"
+            "</main></body></html>"
+        ),
+    )
+    document = _parse_document(page, config)
+    assert document is not None
+    assert document.discovered_links == [
+        "https://netflixtechblog.com/optimizing-recommendation-systems-with-jdks-vector-api-30d2830401ec",
+        "https://netflixtechblog.com/mediafm-the-multimodal-ai-foundation-for-media-understanding-at-netflix-e8c28df82e2d",
+    ]
+
+
 def test_allowed_redirect_host_is_accepted():
     config = _make_config(redirect_allowed_hosts=["newdocs.example.com"])
     initial_request = httpx.Request("GET", "https://docs.example.com/docs/start")
@@ -85,6 +137,51 @@ def test_unrelated_redirect_host_is_rejected():
     history = [httpx.Response(302, request=initial_request, headers={"location": "https://evil.example.org/docs/final"})]
     response = httpx.Response(200, request=redirect_request, history=history, headers={"content-type": "text/html"})
     assert not _is_allowed_redirect("https://docs.example.com/docs/start", response, config)
+
+
+def test_trusted_passthrough_redirect_chain_is_accepted():
+    config = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=["https://netflixtechblog.com/"],
+        redirect_passthrough_hosts=["medium.com"],
+    )
+    initial_request = httpx.Request("GET", "https://netflixtechblog.com/")
+    medium_request = httpx.Request("GET", "https://medium.com/m/global-identity-2")
+    final_request = httpx.Request("GET", "https://netflixtechblog.com/?gi=abc")
+    history = [
+        httpx.Response(307, request=initial_request, headers={"location": "https://medium.com/m/global-identity-2"}),
+        httpx.Response(307, request=medium_request, headers={"location": "https://netflixtechblog.com/?gi=abc"}),
+    ]
+    response = httpx.Response(
+        200,
+        request=final_request,
+        history=history,
+        headers={"content-type": "text/html"},
+    )
+    assert _is_allowed_redirect("https://netflixtechblog.com/", response, config)
+
+
+def test_untrusted_passthrough_redirect_chain_is_rejected():
+    config = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=["https://netflixtechblog.com/"],
+    )
+    initial_request = httpx.Request("GET", "https://netflixtechblog.com/")
+    medium_request = httpx.Request("GET", "https://medium.com/m/global-identity-2")
+    final_request = httpx.Request("GET", "https://netflixtechblog.com/?gi=abc")
+    history = [
+        httpx.Response(307, request=initial_request, headers={"location": "https://medium.com/m/global-identity-2"}),
+        httpx.Response(307, request=medium_request, headers={"location": "https://netflixtechblog.com/?gi=abc"}),
+    ]
+    response = httpx.Response(
+        200,
+        request=final_request,
+        history=history,
+        headers={"content-type": "text/html"},
+    )
+    assert not _is_allowed_redirect("https://netflixtechblog.com/", response, config)
 
 
 def test_strip_noise_handles_malformed_attrs():
@@ -214,6 +311,7 @@ def test_netflix_certificate_error_is_classified():
         base_url=None,
         start_paths=[],
         urls=["https://netflixtechblog.com/"],
+        tls_fallback_strategy="system_trust_store",
         known_failure_label="environment_blocked_tls",
     )
     exc = httpx.ConnectError(
@@ -230,6 +328,7 @@ def test_netflix_failure_classification_is_source_local():
         base_url=None,
         start_paths=[],
         urls=["https://netflixtechblog.com/"],
+        tls_fallback_strategy="system_trust_store",
         known_failure_label="environment_blocked_tls",
     )
     github = _make_config(
@@ -245,6 +344,22 @@ def test_netflix_failure_classification_is_source_local():
         "tls_certificate_verification_failed",
     )
     assert _classify_fetch_error(exc, github) is None
+
+
+def test_tls_fallback_context_is_source_local():
+    netflix = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=["https://netflixtechblog.com/"],
+        tls_fallback_strategy="system_trust_store",
+    )
+    github = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=["https://github.blog/engineering/"],
+    )
+    assert netflix.tls_fallback_strategy == "system_trust_store"
+    assert _build_tls_fallback_context(github) is None
 
 
 def test_insert_retries_after_read_error(monkeypatch):
@@ -499,8 +614,10 @@ def test_fetch_raises_blocked_source_after_repeated_certificate_error(monkeypatc
             base_url=None,
             start_paths=[],
             urls=["https://netflixtechblog.com/"],
+            tls_fallback_strategy="system_trust_store",
             known_failure_label="environment_blocked_tls",
         )
+        monkeypatch.setattr("rag.ingest._fetch_with_tls_fallback", lambda client, url, config: asyncio.sleep(0, result=None))
         try:
             await _fetch_page(client, "https://netflixtechblog.com/", robots, config)
         except SourceFetchBlocked as exc:
@@ -509,5 +626,61 @@ def test_fetch_raises_blocked_source_after_repeated_certificate_error(monkeypatc
         else:
             raise AssertionError("Expected SourceFetchBlocked to be raised")
         assert client.calls == 3
+
+    asyncio.run(run_test())
+
+
+def test_fetch_uses_tls_fallback_and_succeeds(monkeypatch):
+    request = httpx.Request("GET", "https://netflixtechblog.com/")
+    response = httpx.Response(
+        200,
+        request=request,
+        headers={"content-type": "text/html"},
+        text=(
+            "<html><body><main><h1>Netflix Incident Review</h1>"
+            "<p>" + " ".join(["content"] * 260) + "</p>"
+            "</main></body></html>"
+        ),
+    )
+
+    class DummyClient:
+        def __init__(self):
+            self.calls = 0
+            self.headers = httpx.Headers({"User-Agent": "test"})
+            self.timeout = httpx.Timeout(20.0, connect=10.0)
+
+        async def get(self, url, follow_redirects=True):
+            self.calls += 1
+            raise httpx.ConnectError(
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed",
+                request=request,
+            )
+
+    async def fallback_fetch(client, url, config):
+        return response
+
+    monkeypatch.setattr("rag.ingest._sleep_backoff", lambda attempt: asyncio.sleep(0))
+    monkeypatch.setattr("rag.ingest._fetch_with_tls_fallback", fallback_fetch)
+
+    async def run_test():
+        client = DummyClient()
+        robots = RobotsPolicyCache()
+        robots._policies["netflixtechblog.com"] = type(
+            "Policy",
+            (),
+            {"can_fetch": lambda self, user_agent, url: True},
+        )()
+        config = _make_config(
+            base_url=None,
+            start_paths=[],
+            urls=["https://netflixtechblog.com/"],
+            tls_fallback_strategy="system_trust_store",
+            known_failure_label="environment_blocked_tls",
+        )
+        page = await _fetch_page(client, "https://netflixtechblog.com/", robots, config)
+        assert page is not None
+        document = _parse_document(page, config)
+        assert document is not None
+        assert document.section_title == "Netflix Incident Review"
 
     asyncio.run(run_test())
