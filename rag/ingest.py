@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import logging
 import os
+import random
+import re
 import sys
 from collections import deque
 from pathlib import Path
@@ -13,6 +15,7 @@ from urllib.robotparser import RobotFileParser
 
 import httpx
 import tiktoken
+from postgrest.exceptions import APIError
 from bs4 import BeautifulSoup, Tag
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -27,10 +30,16 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 _USER_AGENT = "deep-research-workflow-ingest/1.0"
-_MIN_CONTENT_LENGTH = 200
+_MIN_CONTENT_WORDS = 200
 _REQUEST_DELAY_SECONDS = 1.0
+_MAX_FETCH_ATTEMPTS = 3
+_MAX_INSERT_ATTEMPTS = 3
+_MAX_INSERT_BATCH_SIZE = 25
+_INITIAL_BACKOFF_SECONDS = 0.5
+_RETRYABLE_API_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 _ENCODING = tiktoken.get_encoding("cl100k_base")
 _BLOCKED_TAGS = {
+    "header",
     "nav",
     "footer",
     "aside",
@@ -59,6 +68,23 @@ _CONTENT_TAGS = {
     "table",
 }
 _CONTAINER_TAGS = ("main", "article", "section", "div")
+_WORD_PATTERN = re.compile(r"\b\w+\b")
+_DEFAULT_BLOCKED_PATH_SUBSTRINGS = (
+    "/pricing",
+    "/login",
+    "/logout",
+    "/signin",
+    "/signup",
+    "/404",
+    "/not-found",
+    "/search",
+    "/feed",
+    "/rss",
+    "/newsletter",
+    "/account",
+)
+_NOISE_SECTION_TERMS = ("cookie", "privacy", "consent", "preferences")
+_supabase_client: Client | None = None
 
 
 class SourceConfig(BaseModel):
@@ -68,6 +94,8 @@ class SourceConfig(BaseModel):
     base_url: str | None = None
     start_paths: list[str] = Field(default_factory=list)
     urls: list[str] = Field(default_factory=list)
+    redirect_allowed_hosts: list[str] = Field(default_factory=list)
+    blocked_path_substrings: list[str] = Field(default_factory=list)
 
     model_config = ConfigDict(frozen=True)
 
@@ -95,13 +123,8 @@ class SourceConfig(BaseModel):
                 hosts.add(host)
         if self.base_url:
             hosts.add(urlparse(self.base_url).netloc)
+        hosts.update(host for host in self.redirect_allowed_hosts if host)
         return hosts
-
-    @property
-    def allowed_path_prefixes(self) -> tuple[str, ...]:
-        if self.urls:
-            return tuple()
-        return tuple(self.start_paths)
 
 
 class FetchedPage(BaseModel):
@@ -164,37 +187,50 @@ SOURCES: dict[str, SourceConfig] = {
     "gitlab-handbook": SourceConfig(
         key="gitlab-handbook",
         base_url="https://handbook.gitlab.com",
-        start_paths=["/engineering/", "/product/", "/hiring/", "/security/"],
+        start_paths=["/handbook/engineering/", "/handbook/product/", "/handbook/hiring/", "/handbook/security/", "/handbook/business-technology/", "/handbook/eta/"],
         source_name="GitLab Handbook",
         max_pages=500,
+        blocked_path_substrings=["/blog/"],
     ),
     "stripe-docs": SourceConfig(
         key="stripe-docs",
         base_url="https://docs.stripe.com",
-        start_paths=["/api", "/payments", "/connect", "/billing"],
+        start_paths=["/api", "/payments", "/connect", "/billing", "/webhooks", "/error-handling"],
         source_name="Stripe API Documentation",
         max_pages=200,
+        blocked_path_substrings=["/blog/", "/changelog/"],
     ),
     "anthropic-docs": SourceConfig(
         key="anthropic-docs",
         base_url="https://platform.claude.com",
-        start_paths=["docs/en/intro", "docs/en/api", "docs/en/build-with-claude/overview", "docs/en/about-claude/models/overview"],
+        start_paths=["docs/en/home", "docs/en/intro", "docs/en/api/overview", "docs/en/build-with-claude/overview", "docs/en/about-claude/models/overview"],
         source_name="Anthropic API Documentation",
         max_pages=100,
+        redirect_allowed_hosts=["docs.anthropic.com"],
+        blocked_path_substrings=["/changelog/"],
     ),
     "openai-docs": SourceConfig(
         key="openai-docs",
         base_url="https://developers.openai.com",
-        start_paths=["/api/docs/", "/api/reference/overview/", "/api/docs/models/"],
+        start_paths=["/api/docs", "/api/reference/overview/", "/api/docs/models/"],
         source_name="OpenAI API Documentation",
         max_pages=100,
+        blocked_path_substrings=["/blog/", "/changelog/"],
     ),
     "aws-waf": SourceConfig(
         key="aws-waf",
         base_url="https://docs.aws.amazon.com",
-        start_paths=["/wellarchitected/latest/framework/"],
+        start_paths=["/wellarchitected/latest/framework/",
+            "/wellarchitected/latest/framework/welcome.html",
+            "/wellarchitected/latest/framework/operational-excellence.html",
+            "/wellarchitected/latest/framework/security.html",
+            "/wellarchitected/latest/framework/reliability.html",
+            "/wellarchitected/latest/framework/performance-efficiency.html",
+            "/wellarchitected/latest/framework/cost-optimization.html",
+            "/wellarchitected/latest/framework/sustainability.html"],
         source_name="AWS Well-Architected Framework",
         max_pages=150,
+        blocked_path_substrings=["/blogs/"],
     ),
     "engineering-rfcs": SourceConfig(
         key="engineering-rfcs",
@@ -206,6 +242,7 @@ SOURCES: dict[str, SourceConfig] = {
         ],
         source_name="Engineering RFCs and ADRs",
         max_pages=50,
+        blocked_path_substrings=["/pricing", "/login", "/account"],
     ),
 }
 
@@ -227,10 +264,19 @@ def _require_env(name: str) -> str:
 
 
 def _get_supabase_client() -> Client:
-    return create_client(
-        _require_env("SUPABASE_URL"),
-        _require_env("SUPABASE_SERVICE_KEY"),
-    )
+    global _supabase_client
+    if _supabase_client is None:
+        _supabase_client = create_client(
+            _require_env("SUPABASE_URL"),
+            _require_env("SUPABASE_SERVICE_KEY"),
+        )
+    return _supabase_client
+
+
+def _reset_supabase_client() -> Client:
+    global _supabase_client
+    _supabase_client = None
+    return _get_supabase_client()
 
 
 def _normalize_url(url: str) -> str:
@@ -257,11 +303,37 @@ def _is_allowed_url(url: str, config: SourceConfig) -> bool:
         return False
     if parsed.netloc not in config.allowed_hosts:
         return False
-    if config.allowed_path_prefixes and not any(
-        parsed.path.startswith(prefix) for prefix in config.allowed_path_prefixes
-    ):
+    if _is_blocked_path(parsed.path, config):
         return False
     return True
+
+
+def _is_blocked_path(path: str, config: SourceConfig) -> bool:
+    path_lower = path.lower()
+    blocked_terms = _DEFAULT_BLOCKED_PATH_SUBSTRINGS + tuple(config.blocked_path_substrings)
+    return any(term in path_lower for term in blocked_terms)
+
+
+def _class_tokens(element: Tag) -> list[str]:
+    attrs = element.attrs if isinstance(getattr(element, "attrs", None), dict) else {}
+    raw_classes = attrs.get("class", [])
+    if isinstance(raw_classes, str):
+        return raw_classes.split()
+    if isinstance(raw_classes, list):
+        return [str(token) for token in raw_classes]
+    return []
+
+
+def _id_value(element: Tag) -> str:
+    attrs = element.attrs if isinstance(getattr(element, "attrs", None), dict) else {}
+    raw_id = attrs.get("id")
+    return str(raw_id) if raw_id is not None else ""
+
+
+def _attr_value(element: Tag, name: str) -> str:
+    attrs = element.attrs if isinstance(getattr(element, "attrs", None), dict) else {}
+    value = attrs.get(name)
+    return str(value) if value is not None else ""
 
 
 def _strip_noise(container: Tag) -> None:
@@ -270,14 +342,14 @@ def _strip_noise(container: Tag) -> None:
 
     noisy_selectors = (
         lambda element: any(
-            token in " ".join(element.get("class", [])).lower()
+            token in " ".join(_class_tokens(element)).lower()
             for token in ("nav", "footer", "sidebar", "cookie", "advert", "promo")
         ),
         lambda element: any(
-            token in (element.get("id") or "").lower()
+            token in _id_value(element).lower()
             for token in ("nav", "footer", "sidebar", "cookie", "advert", "promo")
         ),
-        lambda element: element.get("role") in {"navigation", "banner", "complementary"},
+        lambda element: _attr_value(element, "role") in {"navigation", "banner", "complementary"},
     )
 
     for element in list(container.find_all(True)):
@@ -286,8 +358,8 @@ def _strip_noise(container: Tag) -> None:
 
 
 def _select_content_container(soup: BeautifulSoup) -> Tag | None:
-    for selector in ("main", "article"):
-        container = soup.find(selector)
+    for selector in ("main", "article", '[role="main"]', ".content", ".docs-content", ".markdown-body"):
+        container = soup.select_one(selector)
         if isinstance(container, Tag):
             return container
 
@@ -308,8 +380,8 @@ def _candidate_containers(soup: BeautifulSoup) -> list[Tag]:
     candidates: list[Tag] = []
     seen: set[int] = set()
 
-    for selector in ("main", "article"):
-        container = soup.find(selector)
+    for selector in ("main", "article", '[role="main"]', ".content", ".docs-content", ".markdown-body"):
+        container = soup.select_one(selector)
         if isinstance(container, Tag) and id(container) not in seen:
             candidates.append(container)
             seen.add(id(container))
@@ -336,7 +408,7 @@ def _render_content(container: Tag) -> tuple[str, str]:
         if node.name and node.name.startswith("h") and node.name[1:].isdigit():
             heading_level = int(node.name[1])
             rendered = f"{'#' * heading_level} {text}"
-            if not first_heading:
+            if not first_heading and not _is_noise_section_text(text):
                 first_heading = text
         elif node.name == "li":
             rendered = f"- {text}"
@@ -352,6 +424,15 @@ def _render_content(container: Tag) -> tuple[str, str]:
         lines.append(rendered)
 
     return "\n\n".join(lines).strip(), first_heading
+
+
+def _is_noise_section_text(text: str) -> bool:
+    lowered = text.lower()
+    return any(term in lowered for term in _NOISE_SECTION_TERMS)
+
+
+def _word_count(text: str) -> int:
+    return len(_WORD_PATTERN.findall(text))
 
 
 def _extract_links(container: Tag, current_url: str, config: SourceConfig) -> list[str]:
@@ -385,7 +466,7 @@ def _parse_document(page: FetchedPage, config: SourceConfig) -> ParsedDocument |
 
         _strip_noise(container)
         content, first_heading = _render_content(container)
-        if len(content) < _MIN_CONTENT_LENGTH:
+        if _word_count(content) < _MIN_CONTENT_WORDS:
             continue
 
         section_title = first_heading or page_title or config.source_name
@@ -403,24 +484,149 @@ def _parse_document(page: FetchedPage, config: SourceConfig) -> ParsedDocument |
     return best_document
 
 
+def _redirect_chain_hosts(requested_url: str, response: httpx.Response) -> list[str]:
+    hosts = [urlparse(requested_url).netloc.lower()]
+    hosts.extend(urlparse(str(item.url)).netloc.lower() for item in response.history)
+    hosts.append(urlparse(str(response.url)).netloc.lower())
+    return [host for host in hosts if host]
+
+
+def _is_allowed_redirect(requested_url: str, response: httpx.Response, config: SourceConfig) -> bool:
+    final_url = str(response.url)
+    if not _is_allowed_url(final_url, config):
+        return False
+
+    hosts = _redirect_chain_hosts(requested_url, response)
+    host_changes = sum(1 for left, right in zip(hosts, hosts[1:]) if left != right)
+    if host_changes > 1:
+        return False
+    return True
+
+
+async def _sleep_backoff(attempt: int) -> None:
+    delay = _INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.1)
+    await asyncio.sleep(delay)
+
+
+def _api_error_status_code(exc: APIError) -> int | None:
+    for attr in ("code", "status_code", "status"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    if isinstance(getattr(exc, "args", None), tuple) and exc.args:
+        first = exc.args[0]
+        if isinstance(first, dict):
+            for key in ("code", "status_code", "status"):
+                value = first.get(key)
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, str) and value.isdigit():
+                    return int(value)
+    return None
+
+
+def _is_retryable_api_error(exc: APIError) -> bool:
+    status_code = _api_error_status_code(exc)
+    if status_code in _RETRYABLE_API_STATUS_CODES:
+        return True
+    message = str(exc).lower()
+    return any(token in message for token in ("timeout", "tempor", "rate limit", "bad gateway", "service unavailable", "gateway"))
+
+
+async def _run_supabase_operation(
+    operation_name: str,
+    run_operation,
+    *,
+    rows: int | None = None,
+    batch_start: int | None = None,
+) -> Any:
+    active_client = _get_supabase_client()
+    for attempt in range(1, _MAX_INSERT_ATTEMPTS + 1):
+        try:
+            return await asyncio.to_thread(run_operation, active_client)
+        except (httpx.ReadError, httpx.WriteError, httpx.ConnectError, httpx.RemoteProtocolError, httpx.TimeoutException) as exc:
+            if attempt == _MAX_INSERT_ATTEMPTS:
+                raise
+            logger.warning(
+                "Retrying Supabase %s attempt=%s rows=%s batch_start=%s error=%s message=%s",
+                operation_name,
+                attempt,
+                rows,
+                batch_start,
+                type(exc).__name__,
+                str(exc),
+            )
+            active_client = _reset_supabase_client()
+            await _sleep_backoff(attempt)
+        except APIError as exc:
+            if attempt == _MAX_INSERT_ATTEMPTS or not _is_retryable_api_error(exc):
+                raise
+            logger.warning(
+                "Retrying Supabase %s attempt=%s rows=%s batch_start=%s error=%s message=%s",
+                operation_name,
+                attempt,
+                rows,
+                batch_start,
+                type(exc).__name__,
+                str(exc),
+            )
+            active_client = _reset_supabase_client()
+            await _sleep_backoff(attempt)
+
+
 async def _fetch_page(
     client: httpx.AsyncClient,
     url: str,
     robots_cache: RobotsPolicyCache,
+    config: SourceConfig,
 ) -> FetchedPage | None:
     allowed = await robots_cache.can_fetch(client, url)
     if not allowed:
         logger.info("Skipping robots-blocked url=%s", url)
         return None
 
-    try:
-        response = await client.get(url, follow_redirects=True)
-        response.raise_for_status()
-    except httpx.HTTPError:
-        logger.exception("Failed to fetch url=%s", url)
+    response: httpx.Response | None = None
+    for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+        try:
+            response = await client.get(url, follow_redirects=True)
+            response.raise_for_status()
+            break
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            if attempt < _MAX_FETCH_ATTEMPTS and status_code in {408, 429, 500, 502, 503, 504}:
+                logger.warning(
+                    "Retrying fetch url=%s attempt=%s status=%s",
+                    url,
+                    attempt,
+                    status_code,
+                )
+                await _sleep_backoff(attempt)
+                continue
+            logger.exception("Failed to fetch url=%s", url)
+            return None
+        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.TimeoutException):
+            if attempt < _MAX_FETCH_ATTEMPTS:
+                logger.warning("Retrying fetch url=%s attempt=%s", url, attempt)
+                await _sleep_backoff(attempt)
+                continue
+            logger.exception("Failed to fetch url=%s", url)
+            return None
+        finally:
+            await asyncio.sleep(_REQUEST_DELAY_SECONDS)
+
+    if response is None:
         return None
-    finally:
-        await asyncio.sleep(_REQUEST_DELAY_SECONDS)
+
+    if not _is_allowed_redirect(url, response, config):
+        logger.info("Skipping redirect-out-of-scope requested_url=%s final_url=%s", url, response.url)
+        return None
+
+    requested_host = urlparse(url).netloc.lower()
+    final_host = urlparse(str(response.url)).netloc.lower()
+    if requested_host != final_host:
+        logger.info("Following cross-host redirect requested_url=%s final_url=%s", url, response.url)
 
     content_type = response.headers.get("content-type", "")
     if "text/html" not in content_type:
@@ -431,15 +637,19 @@ async def _fetch_page(
 
 
 async def _select_existing_chunk_indices(client: Client, source_url: str) -> set[int]:
-    def _run() -> Any:
+    def _run(active_client: Client) -> Any:
         return (
-            client.table("corpus_chunks")
+            active_client.table("corpus_chunks")
             .select("chunk_index")
             .eq("source_url", source_url)
             .execute()
         )
 
-    response = await asyncio.to_thread(_run)
+    response = await _run_supabase_operation(
+        "select",
+        _run,
+        rows=1,
+    )
     return {
         int(item["chunk_index"])
         for item in (response.data or [])
@@ -451,13 +661,22 @@ async def _insert_chunk_rows(client: Client, rows: list[CorpusChunkRow]) -> int:
     if not rows:
         return 0
 
+    inserted_count = 0
     payload = [row.model_dump() for row in rows]
+    for batch_start in range(0, len(payload), _MAX_INSERT_BATCH_SIZE):
+        batch = payload[batch_start : batch_start + _MAX_INSERT_BATCH_SIZE]
+        def _run(active_client: Client) -> Any:
+            return active_client.table("corpus_chunks").insert(batch).execute()
 
-    def _run() -> Any:
-        return client.table("corpus_chunks").insert(payload).execute()
+        await _run_supabase_operation(
+            "insert",
+            _run,
+            rows=len(batch),
+            batch_start=batch_start,
+        )
+        inserted_count += len(batch)
 
-    await asyncio.to_thread(_run)
-    return len(rows)
+    return inserted_count
 
 
 async def _ingest_document(
@@ -515,7 +734,7 @@ async def ingest_source(
     async with httpx.AsyncClient(headers=headers, timeout=timeout) as http_client:
         while queue and stats.pages_fetched < page_limit:
             url = queue.popleft()
-            page = await _fetch_page(http_client, url, robots_cache)
+            page = await _fetch_page(http_client, url, robots_cache, config)
             if page is None:
                 stats.pages_skipped += 1
                 continue
