@@ -96,6 +96,9 @@ class SourceConfig(BaseModel):
     urls: list[str] = Field(default_factory=list)
     redirect_allowed_hosts: list[str] = Field(default_factory=list)
     blocked_path_substrings: list[str] = Field(default_factory=list)
+    allowed_path_prefixes: list[str] = Field(default_factory=list)
+    extra_headers: dict[str, str] = Field(default_factory=dict)
+    known_failure_label: str | None = None
 
     model_config = ConfigDict(frozen=True)
 
@@ -156,6 +159,15 @@ class IngestionStats(BaseModel):
     chunks_created: int = 0
     chunks_inserted: int = 0
     token_estimate: int = 0
+    final_status: str = "completed"
+    status_detail: str | None = None
+
+
+class SourceFetchBlocked(Exception):
+    def __init__(self, status: str, detail: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
 
 
 class RobotsPolicyCache:
@@ -232,17 +244,47 @@ SOURCES: dict[str, SourceConfig] = {
         max_pages=150,
         blocked_path_substrings=["/blogs/"],
     ),
-    "engineering-rfcs": SourceConfig(
-        key="engineering-rfcs",
+    "cloudflare-rfcs": SourceConfig(
+        key="cloudflare-rfcs",
         urls=[
             "https://blog.cloudflare.com/tag/engineering/",
+        ],
+        source_name="Engineering RFCs and ADRs (Cloudflare)",
+        max_pages=25,
+        blocked_path_substrings=["/pricing", "/login", "/account", "/tag/", "/author/", "/cdn-cgi/"],
+    ),
+    "uber-rfcs": SourceConfig(
+        key="uber-rfcs",
+        urls=[
             "https://www.uber.com/blog/engineering/",
+        ],
+        source_name="Engineering RFCs and ADRs (Uber)",
+        max_pages=15,
+        blocked_path_substrings=["/pricing", "/login", "/account", "/author/", "/tag/"],
+        allowed_path_prefixes=["/blog/"],
+        extra_headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    ),
+    "netflix-rfcs": SourceConfig(
+        key="netflix-rfcs",
+        urls=[
             "https://netflixtechblog.com/",
+        ],
+        source_name="Engineering RFCs and ADRs (Netflix)",
+        max_pages=15,
+        blocked_path_substrings=["/pricing", "/login", "/account", "/tag/", "/author/"],
+        known_failure_label="environment_blocked_tls",
+    ),
+    "github-rfcs": SourceConfig(
+        key="github-rfcs",
+        urls=[
             "https://github.blog/engineering/",
         ],
-        source_name="Engineering RFCs and ADRs",
+        source_name="Engineering RFCs and ADRs (GitHub)",
         max_pages=50,
-        blocked_path_substrings=["/pricing", "/login", "/account"],
+        blocked_path_substrings=["/pricing", "/login", "/account", "/tag/", "/author/", "/categories/"],
     ),
 }
 
@@ -298,10 +340,18 @@ def _normalize_url(url: str) -> str:
 
 
 def _is_allowed_url(url: str, config: SourceConfig) -> bool:
+    normalized = _normalize_url(url)
+    if normalized in {_normalize_url(seed_url) for seed_url in config.seed_urls}:
+        return True
+
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         return False
     if parsed.netloc not in config.allowed_hosts:
+        return False
+    if config.allowed_path_prefixes and not any(
+        parsed.path.startswith(prefix) for prefix in config.allowed_path_prefixes
+    ):
         return False
     if _is_blocked_path(parsed.path, config):
         return False
@@ -312,6 +362,12 @@ def _is_blocked_path(path: str, config: SourceConfig) -> bool:
     path_lower = path.lower()
     blocked_terms = _DEFAULT_BLOCKED_PATH_SUBSTRINGS + tuple(config.blocked_path_substrings)
     return any(term in path_lower for term in blocked_terms)
+
+
+def _build_client_headers(config: SourceConfig) -> dict[str, str]:
+    headers = {"User-Agent": _USER_AGENT}
+    headers.update(config.extra_headers)
+    return headers
 
 
 def _class_tokens(element: Tag) -> list[str]:
@@ -435,6 +491,10 @@ def _word_count(text: str) -> int:
     return len(_WORD_PATTERN.findall(text))
 
 
+def _is_listing_like_page(content: str, discovered_links: list[str]) -> bool:
+    return len(discovered_links) >= 12 and _word_count(content) < 350
+
+
 def _extract_links(container: Tag, current_url: str, config: SourceConfig) -> list[str]:
     discovered_links: list[str] = []
     seen: set[str] = set()
@@ -470,12 +530,16 @@ def _parse_document(page: FetchedPage, config: SourceConfig) -> ParsedDocument |
             continue
 
         section_title = first_heading or page_title or config.source_name
+        discovered_links = _extract_links(container, page.url, config)
+        if _is_listing_like_page(content, discovered_links):
+            continue
+
         document = ParsedDocument(
             source_name=config.source_name,
             source_url=page.url,
             section_title=section_title,
             content=content,
-            discovered_links=_extract_links(container, page.url, config),
+            discovered_links=discovered_links,
         )
         if len(document.content) > best_length:
             best_document = document
@@ -533,6 +597,17 @@ def _is_retryable_api_error(exc: APIError) -> bool:
         return True
     message = str(exc).lower()
     return any(token in message for token in ("timeout", "tempor", "rate limit", "bad gateway", "service unavailable", "gateway"))
+
+
+def _classify_fetch_error(exc: Exception, config: SourceConfig) -> tuple[str, str] | None:
+    message = str(exc).lower()
+    if (
+        config.known_failure_label == "environment_blocked_tls"
+        and isinstance(exc, (httpx.ConnectError, httpx.ReadError))
+        and "certificate verify failed" in message
+    ):
+        return ("environment_blocked", "tls_certificate_verification_failed")
+    return None
 
 
 async def _run_supabase_operation(
@@ -606,11 +681,22 @@ async def _fetch_page(
                 continue
             logger.exception("Failed to fetch url=%s", url)
             return None
-        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.TimeoutException):
+        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.TimeoutException) as exc:
             if attempt < _MAX_FETCH_ATTEMPTS:
                 logger.warning("Retrying fetch url=%s attempt=%s", url, attempt)
                 await _sleep_backoff(attempt)
                 continue
+            classified = _classify_fetch_error(exc, config)
+            if classified is not None:
+                status, detail = classified
+                logger.error(
+                    "Classified source fetch failure source=%s url=%s status=%s detail=%s",
+                    config.source_name,
+                    url,
+                    status,
+                    detail,
+                )
+                raise SourceFetchBlocked(status, detail) from exc
             logger.exception("Failed to fetch url=%s", url)
             return None
         finally:
@@ -729,12 +815,18 @@ async def ingest_source(
     robots_cache = RobotsPolicyCache()
     supabase_client = _get_supabase_client()
 
-    headers = {"User-Agent": _USER_AGENT}
+    headers = _build_client_headers(config)
     timeout = httpx.Timeout(20.0, connect=10.0)
     async with httpx.AsyncClient(headers=headers, timeout=timeout) as http_client:
         while queue and stats.pages_fetched < page_limit:
             url = queue.popleft()
-            page = await _fetch_page(http_client, url, robots_cache, config)
+            try:
+                page = await _fetch_page(http_client, url, robots_cache, config)
+            except SourceFetchBlocked as exc:
+                stats.pages_skipped += 1
+                stats.final_status = exc.status
+                stats.status_detail = exc.detail
+                break
             if page is None:
                 stats.pages_skipped += 1
                 continue
@@ -773,6 +865,17 @@ async def ingest_source(
         stats.chunks_inserted,
         stats.token_estimate,
     )
+    if stats.final_status != "completed":
+        logger.info(
+            "Source verdict source=%s final_status=%s detail=%s",
+            stats.source_name,
+            stats.final_status,
+            stats.status_detail,
+        )
+        print(
+            f"Source verdict for {stats.source_name}: "
+            f"{stats.final_status} ({stats.status_detail})"
+        )
     print(f"Ingested {stats.chunks_inserted} chunks from {config.source_name}")
     return stats
 

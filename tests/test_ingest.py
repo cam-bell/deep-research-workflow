@@ -9,10 +9,14 @@ from rag.ingest import (
     FetchedPage,
     RobotsPolicyCache,
     SourceConfig,
+    SourceFetchBlocked,
+    _build_client_headers,
+    _classify_fetch_error,
     _fetch_page,
     _insert_chunk_rows,
     _is_allowed_redirect,
     _is_allowed_url,
+    _is_listing_like_page,
     _parse_document,
     _select_existing_chunk_indices,
     _strip_noise,
@@ -39,6 +43,30 @@ def test_same_host_links_allowed_outside_seed_prefix():
 def test_blocked_noise_paths_are_rejected():
     config = _make_config(blocked_path_substrings=["/blog/"])
     assert not _is_allowed_url("https://docs.example.com/blog/post", config)
+
+
+def test_cloudflare_tag_and_author_urls_are_rejected():
+    config = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=["https://blog.cloudflare.com/tag/engineering/"],
+        blocked_path_substrings=["/tag/", "/author/"],
+    )
+    assert not _is_allowed_url("https://blog.cloudflare.com/tag/rust/", config)
+    assert not _is_allowed_url("https://blog.cloudflare.com/author/example/", config)
+
+
+def test_cloudflare_article_urls_are_allowed():
+    config = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=["https://blog.cloudflare.com/tag/engineering/"],
+        blocked_path_substrings=["/tag/", "/author/"],
+    )
+    assert _is_allowed_url(
+        "https://blog.cloudflare.com/ecdysis-rust-graceful-restarts/",
+        config,
+    )
 
 
 def test_allowed_redirect_host_is_accepted():
@@ -100,6 +128,123 @@ def test_parse_document_uses_role_main_container():
     document = _parse_document(page, config)
     assert document is not None
     assert document.section_title == "Guide"
+
+
+def test_listing_like_pages_are_skipped():
+    config = _make_config()
+    links = "".join(
+        f"<li><a href='/docs/article-{index}'>Article {index}</a></li>"
+        for index in range(20)
+    )
+    page = FetchedPage(
+        url="https://docs.example.com/docs/start",
+        html=(
+            "<html><body><main><h1>Engineering</h1>"
+            "<p>" + " ".join(["summary"] * 220) + "</p>"
+            f"<ul>{links}</ul>"
+            "</main></body></html>"
+        ),
+    )
+    assert _parse_document(page, config) is None
+
+
+def test_article_like_pages_are_kept_even_with_links():
+    config = _make_config()
+    links = "".join(
+        f"<li><a href='/docs/article-{index}'>Related {index}</a></li>"
+        for index in range(4)
+    )
+    page = FetchedPage(
+        url="https://docs.example.com/docs/start",
+        html=(
+            "<html><body><main><h1>Engineering</h1>"
+            "<p>" + " ".join(["content"] * 380) + "</p>"
+            f"<ul>{links}</ul>"
+            "</main></body></html>"
+        ),
+    )
+    document = _parse_document(page, config)
+    assert document is not None
+    assert document.section_title == "Engineering"
+
+
+def test_host_specific_headers_are_applied():
+    config = _make_config(
+        extra_headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    )
+    headers = _build_client_headers(config)
+    assert headers["User-Agent"]
+    assert headers["Accept"] == "text/html,application/xhtml+xml"
+    assert headers["Accept-Language"] == "en-US,en;q=0.9"
+
+
+def test_host_specific_blocked_paths_do_not_affect_other_sources():
+    cloudflare = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=["https://blog.cloudflare.com/tag/engineering/"],
+        blocked_path_substrings=["/tag/", "/author/"],
+    )
+    github = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=["https://github.blog/engineering/"],
+        blocked_path_substrings=["/categories/"],
+    )
+    assert not _is_allowed_url("https://blog.cloudflare.com/tag/rust/", cloudflare)
+    assert _is_allowed_url("https://github.blog/tag/rust/", github)
+
+
+def test_allowed_path_prefixes_constrain_host_specific_crawls():
+    uber = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=["https://www.uber.com/blog/engineering/"],
+        allowed_path_prefixes=["/blog/"],
+    )
+    assert _is_allowed_url("https://www.uber.com/blog/database-federation/", uber)
+    assert not _is_allowed_url("https://www.uber.com/us/en/careers/list/", uber)
+
+
+def test_netflix_certificate_error_is_classified():
+    config = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=["https://netflixtechblog.com/"],
+        known_failure_label="environment_blocked_tls",
+    )
+    exc = httpx.ConnectError(
+        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed",
+    )
+    assert _classify_fetch_error(exc, config) == (
+        "environment_blocked",
+        "tls_certificate_verification_failed",
+    )
+
+
+def test_netflix_failure_classification_is_source_local():
+    netflix = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=["https://netflixtechblog.com/"],
+        known_failure_label="environment_blocked_tls",
+    )
+    github = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=["https://github.blog/engineering/"],
+    )
+    exc = httpx.ConnectError(
+        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed",
+    )
+    assert _classify_fetch_error(exc, netflix) == (
+        "environment_blocked",
+        "tls_certificate_verification_failed",
+    )
+    assert _classify_fetch_error(exc, github) is None
 
 
 def test_insert_retries_after_read_error(monkeypatch):
@@ -322,5 +467,47 @@ def test_fetch_retries_after_transient_error(monkeypatch):
         page = await _fetch_page(client, "https://docs.example.com/docs/start", robots, _make_config())
         assert page is not None
         assert client.calls == 2
+
+    asyncio.run(run_test())
+
+
+def test_fetch_raises_blocked_source_after_repeated_certificate_error(monkeypatch):
+    request = httpx.Request("GET", "https://netflixtechblog.com/")
+
+    class DummyClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def get(self, url, follow_redirects=True):
+            self.calls += 1
+            raise httpx.ConnectError(
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed",
+                request=request,
+            )
+
+    monkeypatch.setattr("rag.ingest._sleep_backoff", lambda attempt: asyncio.sleep(0))
+
+    async def run_test():
+        client = DummyClient()
+        robots = RobotsPolicyCache()
+        robots._policies["netflixtechblog.com"] = type(
+            "Policy",
+            (),
+            {"can_fetch": lambda self, user_agent, url: True},
+        )()
+        config = _make_config(
+            base_url=None,
+            start_paths=[],
+            urls=["https://netflixtechblog.com/"],
+            known_failure_label="environment_blocked_tls",
+        )
+        try:
+            await _fetch_page(client, "https://netflixtechblog.com/", robots, config)
+        except SourceFetchBlocked as exc:
+            assert exc.status == "environment_blocked"
+            assert exc.detail == "tls_certificate_verification_failed"
+        else:
+            raise AssertionError("Expected SourceFetchBlocked to be raised")
+        assert client.calls == 3
 
     asyncio.run(run_test())
