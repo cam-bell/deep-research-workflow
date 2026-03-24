@@ -34,8 +34,8 @@ _USER_AGENT = "deep-research-workflow-ingest/1.0"
 _MIN_CONTENT_WORDS = 200
 _REQUEST_DELAY_SECONDS = 1.0
 _MAX_FETCH_ATTEMPTS = 3
-_MAX_INSERT_ATTEMPTS = 3
-_MAX_INSERT_BATCH_SIZE = 25
+_MAX_INSERT_ATTEMPTS = 4
+_MAX_INSERT_BATCH_SIZE = 20
 _INITIAL_BACKOFF_SECONDS = 0.5
 _RETRYABLE_API_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 _ENCODING = tiktoken.get_encoding("cl100k_base")
@@ -94,6 +94,22 @@ _NOISE_SECTION_TERMS = (
     "read the paper",
     "acknowledgments",
 )
+_GITHUB_NOISE_SECTION_TERMS = (
+    "share:",
+    "tags:",
+    "we do newsletters, too",
+    "site-wide links",
+    "related posts",
+    "more on",
+    "explore more from github",
+)
+_GITHUB_CATEGORY_PATH_SEGMENTS = {
+    "architecture-optimization",
+    "engineering-principles",
+    "infrastructure",
+    "platform-security",
+    "user-experience",
+}
 _NOISE_CLASS_ID_TOKENS = (
     "nav",
     "footer",
@@ -122,6 +138,7 @@ class SourceConfig(BaseModel):
     base_url: str | None = None
     start_paths: list[str] = Field(default_factory=list)
     urls: list[str] = Field(default_factory=list)
+    extra_seed_urls: list[str] = Field(default_factory=list)
     redirect_allowed_hosts: list[str] = Field(default_factory=list)
     redirect_passthrough_hosts: list[str] = Field(default_factory=list)
     blocked_path_substrings: list[str] = Field(default_factory=list)
@@ -134,18 +151,20 @@ class SourceConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_seed_configuration(self) -> "SourceConfig":
-        if not self.base_url and not self.urls:
-            raise ValueError("Source config must define either base_url or urls")
-        if self.base_url and not self.start_paths and not self.urls:
-            raise ValueError("Source config with base_url must define start_paths")
+        if not self.base_url and not self.urls and not self.extra_seed_urls:
+            raise ValueError("Source config must define start paths, urls, or extra seed urls")
+        if self.base_url and not self.start_paths and not self.urls and not self.extra_seed_urls:
+            raise ValueError("Source config with base_url must define start paths or seed urls")
         return self
 
     @property
     def seed_urls(self) -> list[str]:
-        if self.urls:
-            return self.urls
-        assert self.base_url is not None
-        return [urljoin(self.base_url, path) for path in self.start_paths]
+        seeds: list[str] = []
+        if self.base_url:
+            seeds.extend(urljoin(self.base_url, path) for path in self.start_paths)
+        seeds.extend(self.urls)
+        seeds.extend(self.extra_seed_urls)
+        return seeds
 
     @property
     def allowed_hosts(self) -> set[str]:
@@ -235,10 +254,31 @@ SOURCES: dict[str, SourceConfig] = {
     "gitlab-handbook": SourceConfig(
         key="gitlab-handbook",
         base_url="https://handbook.gitlab.com",
-        start_paths=["/handbook/engineering/", "/handbook/product/", "/handbook/hiring/", "/handbook/security/", "/handbook/business-technology/", "/handbook/eta/"],
+        start_paths=[
+            "/handbook/engineering/",
+            "/handbook/engineering/devops/",
+            "/handbook/engineering/devops/oncall/",
+            "/handbook/engineering/incident-management/",
+            "/handbook/engineering/infrastructure/",
+            "/handbook/engineering/infrastructure-platforms/incident-management/",
+            "/handbook/values/",
+            "/handbook/product-development/",
+        ],
+        extra_seed_urls=[
+            "https://handbook.gitlab.com/handbook/engineering/devops/oncall/communication-and-culture/",
+            "https://handbook.gitlab.com/handbook/engineering/devops/oncall/",
+            "https://handbook.gitlab.com/handbook/engineering/incident-management/",
+            "https://handbook.gitlab.com/handbook/engineering/infrastructure-platforms/incident-management/",
+            "https://handbook.gitlab.com/handbook/values/",
+        ],
         source_name="GitLab Handbook",
         max_pages=500,
         blocked_path_substrings=["/blog/"],
+        allowed_path_prefixes=[
+            "/handbook/engineering/",
+            "/handbook/values/",
+            "/handbook/product-development/",
+        ],
     ),
     "stripe-docs": SourceConfig(
         key="stripe-docs",
@@ -255,7 +295,18 @@ SOURCES: dict[str, SourceConfig] = {
         source_name="Anthropic API Documentation",
         max_pages=100,
         redirect_allowed_hosts=["docs.anthropic.com"],
-        blocked_path_substrings=["/changelog/"],
+        blocked_path_substrings=[
+            "/changelog/",
+            "/settings",
+            "/workbench",
+            "/dashboard",
+            "/usage",
+            "/cost",
+            "/cookbook",
+            "/cookbooks",
+            "/cdn-cgi/",
+        ],
+        allowed_path_prefixes=["/docs/en/", "/en/docs/"],
     ),
     "openai-docs": SourceConfig(
         key="openai-docs",
@@ -268,17 +319,25 @@ SOURCES: dict[str, SourceConfig] = {
     "aws-waf": SourceConfig(
         key="aws-waf",
         base_url="https://docs.aws.amazon.com",
-        start_paths=["/wellarchitected/latest/framework/",
-            "/wellarchitected/latest/framework/welcome.html",
-            "/wellarchitected/latest/framework/operational-excellence.html",
-            "/wellarchitected/latest/framework/security.html",
+        start_paths=[
+            "/wellarchitected/latest/framework/",
             "/wellarchitected/latest/framework/reliability.html",
-            "/wellarchitected/latest/framework/performance-efficiency.html",
-            "/wellarchitected/latest/framework/cost-optimization.html",
-            "/wellarchitected/latest/framework/sustainability.html"],
+            "/wellarchitected/latest/reliability-pillar/",
+            "/wellarchitected/latest/security-pillar/",
+            "/wellarchitected/latest/operational-excellence-pillar/",
+            "/wellarchitected/latest/performance-efficiency-pillar/",
+            "/wellarchitected/latest/cost-optimization-pillar/",
+        ],
+        extra_seed_urls=[
+            "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/",
+            "https://docs.aws.amazon.com/wellarchitected/latest/framework/reliability.html",
+            "https://docs.aws.amazon.com/wellarchitected/latest/framework/rel-dp.html",
+            "https://docs.aws.amazon.com/wellarchitected/latest/framework/rel-bp.html",
+        ],
         source_name="AWS Well-Architected Framework",
         max_pages=150,
         blocked_path_substrings=["/blogs/"],
+        allowed_path_prefixes=["/wellarchitected/latest/"],
     ),
     "cloudflare-rfcs": SourceConfig(
         key="cloudflare-rfcs",
@@ -333,6 +392,7 @@ SOURCES: dict[str, SourceConfig] = {
         source_name="Engineering RFCs and ADRs (GitHub)",
         max_pages=50,
         blocked_path_substrings=["/pricing", "/login", "/account", "/tag/", "/author/", "/categories/"],
+        allowed_path_prefixes=["/engineering/"],
     ),
     "meta-rfcs": SourceConfig(
         key="meta-rfcs",
@@ -534,7 +594,7 @@ def _candidate_containers(soup: BeautifulSoup) -> list[Tag]:
     return candidates
 
 
-def _render_content(container: Tag) -> tuple[str, str]:
+def _render_content(container: Tag, config: SourceConfig) -> tuple[str, str]:
     lines: list[str] = []
     first_heading = ""
 
@@ -542,12 +602,14 @@ def _render_content(container: Tag) -> tuple[str, str]:
         text = node.get_text("\n" if node.name == "pre" else " ", strip=True)
         if not text:
             continue
-        if _is_noise_section_text(text) and _word_count(text) <= 12:
+        if _is_noise_section_text(text, config) and _word_count(text) <= 12:
+            if not lines:
+                continue
             break
         if node.name and node.name.startswith("h") and node.name[1:].isdigit():
             heading_level = int(node.name[1])
             rendered = f"{'#' * heading_level} {text}"
-            if not first_heading and not _is_noise_section_text(text):
+            if not first_heading and not _is_noise_section_text(text, config):
                 first_heading = text
         elif node.name == "li":
             rendered = f"- {text}"
@@ -565,9 +627,13 @@ def _render_content(container: Tag) -> tuple[str, str]:
     return "\n\n".join(lines).strip(), first_heading
 
 
-def _is_noise_section_text(text: str) -> bool:
+def _is_noise_section_text(text: str, config: SourceConfig | None = None) -> bool:
     lowered = text.lower()
-    return any(term in lowered for term in _NOISE_SECTION_TERMS)
+    if any(term in lowered for term in _NOISE_SECTION_TERMS):
+        return True
+    if config and config.key == "github-rfcs":
+        return any(term in lowered for term in _GITHUB_NOISE_SECTION_TERMS)
+    return False
 
 
 def _word_count(text: str) -> int:
@@ -576,6 +642,29 @@ def _word_count(text: str) -> int:
 
 def _is_listing_like_page(content: str, discovered_links: list[str]) -> bool:
     return len(discovered_links) >= 12 and _word_count(content) < 350
+
+
+def _looks_like_github_article(page: FetchedPage, content: str, discovered_links: list[str]) -> bool:
+    parsed = urlparse(page.url)
+    path_segments = [segment for segment in parsed.path.split("/") if segment]
+    if not path_segments or path_segments[0] != "engineering":
+        return False
+    if len(path_segments) == 1:
+        return False
+    if len(path_segments) == 2 and path_segments[1] in _GITHUB_CATEGORY_PATH_SEGMENTS:
+        return False
+    return _word_count(content) >= _MIN_CONTENT_WORDS and len(discovered_links) < 40
+
+
+def _is_source_listing_page(
+    page: FetchedPage,
+    config: SourceConfig,
+    content: str,
+    discovered_links: list[str],
+) -> bool:
+    if config.key == "github-rfcs":
+        return not _looks_like_github_article(page, content, discovered_links)
+    return _is_listing_like_page(content, discovered_links)
 
 
 def _extract_links(container: Tag, current_url: str, config: SourceConfig) -> list[str]:
@@ -613,13 +702,13 @@ def _parse_document(page: FetchedPage, config: SourceConfig) -> PageParseResult:
         candidate_links = _extract_links(container, page.url, config)
         if len(candidate_links) > len(discovered_links):
             discovered_links = candidate_links
-        content, first_heading = _render_content(container)
+        content, first_heading = _render_content(container, config)
         if _word_count(content) < _MIN_CONTENT_WORDS:
             skip_reason = "thin_page"
             continue
 
         section_title = first_heading or page_title or config.source_name
-        if _is_listing_like_page(content, candidate_links):
+        if _is_source_listing_page(page, config, content, candidate_links):
             skip_reason = "listing_page"
             continue
 
@@ -696,6 +785,21 @@ def _is_retryable_api_error(exc: APIError) -> bool:
         return True
     message = str(exc).lower()
     return any(token in message for token in ("timeout", "tempor", "rate limit", "bad gateway", "service unavailable", "gateway"))
+
+
+def _is_retryable_supabase_exception(exc: Exception) -> bool:
+    if isinstance(
+        exc,
+        (
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.ConnectError,
+            httpx.RemoteProtocolError,
+            httpx.TimeoutException,
+        ),
+    ):
+        return True
+    return isinstance(exc, APIError) and _is_retryable_api_error(exc)
 
 
 def _classify_fetch_error(exc: Exception, config: SourceConfig) -> tuple[str, str] | None:
@@ -907,18 +1011,38 @@ async def _insert_chunk_rows(client: Client, rows: list[CorpusChunkRow]) -> int:
 
     inserted_count = 0
     payload = [row.model_dump() for row in rows]
-    for batch_start in range(0, len(payload), _MAX_INSERT_BATCH_SIZE):
-        batch = payload[batch_start : batch_start + _MAX_INSERT_BATCH_SIZE]
+
+    async def _insert_payload_batch(batch: list[dict[str, Any]], batch_start: int) -> int:
         def _run(active_client: Client) -> Any:
             return active_client.table("corpus_chunks").insert(batch).execute()
 
-        await _run_supabase_operation(
-            "insert",
-            _run,
-            rows=len(batch),
-            batch_start=batch_start,
-        )
-        inserted_count += len(batch)
+        try:
+            await _run_supabase_operation(
+                "insert",
+                _run,
+                rows=len(batch),
+                batch_start=batch_start,
+            )
+            return len(batch)
+        except Exception as exc:
+            if len(batch) == 1 or not _is_retryable_supabase_exception(exc):
+                raise
+
+            split_point = max(1, len(batch) // 2)
+            logger.warning(
+                "Splitting Supabase insert batch rows=%s batch_start=%s error=%s message=%s",
+                len(batch),
+                batch_start,
+                type(exc).__name__,
+                str(exc),
+            )
+            left = await _insert_payload_batch(batch[:split_point], batch_start)
+            right = await _insert_payload_batch(batch[split_point:], batch_start + split_point)
+            return left + right
+
+    for batch_start in range(0, len(payload), _MAX_INSERT_BATCH_SIZE):
+        batch = payload[batch_start : batch_start + _MAX_INSERT_BATCH_SIZE]
+        inserted_count += await _insert_payload_batch(batch, batch_start)
 
     return inserted_count
 

@@ -8,6 +8,7 @@ from rag.ingest import CorpusChunkRow
 from rag.ingest import (
     FetchedPage,
     RobotsPolicyCache,
+    SOURCES,
     SourceConfig,
     SourceFetchBlocked,
     _build_client_headers,
@@ -117,6 +118,30 @@ def test_meta_non_article_routes_are_rejected():
     assert not _is_allowed_url("https://engineering.fb.com/author/example/", config)
     assert not _is_allowed_url("https://engineering.fb.com/videos", config)
     assert not _is_allowed_url("https://www.metacareers.com/jobs/123", config)
+
+
+def test_anthropic_docs_stay_inside_docs_tree():
+    config = _make_config(
+        base_url="https://platform.claude.com",
+        start_paths=["docs/en/home"],
+        redirect_allowed_hosts=["docs.anthropic.com"],
+        blocked_path_substrings=[
+            "/settings",
+            "/workbench",
+            "/dashboard",
+            "/usage",
+            "/cost",
+            "/cookbook",
+            "/cookbooks",
+            "/cdn-cgi/",
+        ],
+        allowed_path_prefixes=["/docs/en/", "/en/docs/"],
+    )
+    assert _is_allowed_url("https://platform.claude.com/docs/en/api/messages", config)
+    assert _is_allowed_url("https://docs.anthropic.com/en/docs/models-overview", config)
+    assert not _is_allowed_url("https://platform.claude.com/settings/keys", config)
+    assert not _is_allowed_url("https://platform.claude.com/workbench", config)
+    assert not _is_allowed_url("https://platform.claude.com/cookbook/tool-use-calculator-tool", config)
 
 
 def test_netflix_article_page_discovers_canonical_article_links():
@@ -380,6 +405,69 @@ def test_parse_document_truncates_at_noise_section_terms():
     assert "Acknowledgments" not in parse_result.document.content
 
 
+def test_github_article_truncates_at_newsletter_footer_noise():
+    config = _make_config(
+        key="github-rfcs",
+        base_url=None,
+        start_paths=[],
+        urls=["https://github.blog/engineering/"],
+        blocked_path_substrings=["/pricing", "/login", "/account", "/tag/", "/author/", "/categories/"],
+        allowed_path_prefixes=["/engineering/"],
+    )
+    page = FetchedPage(
+        url="https://github.blog/engineering/infrastructure/how-github-engineers-tackle-platform-problems/",
+        html=(
+            "<html><body><main>"
+            "<h1>How GitHub engineers tackle platform problems</h1>"
+            "<p>Written by</p>"
+            "<p>" + " ".join(["content"] * 260) + "</p>"
+            "<h2>Share:</h2>"
+            "<ul><li>X</li><li>LinkedIn</li></ul>"
+            "<h2>We do newsletters, too</h2>"
+            "<p>Subscribe for updates</p>"
+            "<h2>Site-wide Links</h2>"
+            "<p>Pricing Docs Careers</p>"
+            "</main></body></html>"
+        ),
+    )
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is not None
+    assert "Share:" not in parse_result.document.content
+    assert "Subscribe for updates" not in parse_result.document.content
+    assert "Site-wide Links" not in parse_result.document.content
+
+
+def test_github_article_excludes_tags_related_and_more_sections():
+    config = _make_config(
+        key="github-rfcs",
+        base_url=None,
+        start_paths=[],
+        urls=["https://github.blog/engineering/"],
+        blocked_path_substrings=["/pricing", "/login", "/account", "/tag/", "/author/", "/categories/"],
+        allowed_path_prefixes=["/engineering/"],
+    )
+    page = FetchedPage(
+        url="https://github.blog/engineering/platform-security/defense-systems-at-scale/",
+        html=(
+            "<html><body><article>"
+            "<h1>Defense systems at scale</h1>"
+            "<p>" + " ".join(["content"] * 260) + "</p>"
+            "<h2>Tags:</h2>"
+            "<ul><li>security</li><li>platform</li></ul>"
+            "<h2>Related posts</h2>"
+            "<p>Another post</p>"
+            "<h2>More on</h2>"
+            "<p>Platform security</p>"
+            "</article></body></html>"
+        ),
+    )
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is not None
+    assert "Tags:" not in parse_result.document.content
+    assert "Related posts" not in parse_result.document.content
+    assert "Platform security" not in parse_result.document.content
+
+
 def test_parse_document_uses_role_main_container():
     config = _make_config()
     paragraph = " ".join(["content"] * 250)
@@ -433,6 +521,84 @@ def test_article_like_pages_are_kept_even_with_links():
     assert parse_result.document.section_title == "Engineering"
 
 
+def test_github_engineering_landing_page_is_discovery_only():
+    config = _make_config(
+        key="github-rfcs",
+        base_url=None,
+        start_paths=[],
+        urls=["https://github.blog/engineering/"],
+        blocked_path_substrings=["/pricing", "/login", "/account", "/tag/", "/author/", "/categories/"],
+        allowed_path_prefixes=["/engineering/"],
+    )
+    links = "".join(
+        f"<a href='https://github.blog/engineering/infrastructure/article-{index}/'>Article {index}</a>"
+        for index in range(1, 14)
+    )
+    page = FetchedPage(
+        url="https://github.blog/engineering/",
+        html=(
+            "<html><body><main>"
+            "<h1>Engineering</h1>"
+            "<p>" + " ".join(["summary"] * 260) + "</p>"
+            "<h2>Featured</h2>"
+            f"{links}"
+            "</main></body></html>"
+        ),
+    )
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is None
+    assert parse_result.skip_reason == "listing_page"
+    assert len(parse_result.discovered_links) == 13
+
+
+def test_github_subcategory_page_is_discovery_only_even_when_substantive():
+    config = _make_config(
+        key="github-rfcs",
+        base_url=None,
+        start_paths=[],
+        urls=["https://github.blog/engineering/"],
+        blocked_path_substrings=["/pricing", "/login", "/account", "/tag/", "/author/", "/categories/"],
+        allowed_path_prefixes=["/engineering/"],
+    )
+    links = "".join(
+        f"<a href='https://github.blog/engineering/infrastructure/article-{index}/'>Article {index}</a>"
+        for index in range(1, 10)
+    )
+    page = FetchedPage(
+        url="https://github.blog/engineering/infrastructure/",
+        html=(
+            "<html><body><main>"
+            "<h1>Infrastructure</h1>"
+            "<p>" + " ".join(["summary"] * 420) + "</p>"
+            "<h2>Featured</h2>"
+            f"{links}"
+            "</main></body></html>"
+        ),
+    )
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is None
+    assert parse_result.skip_reason == "listing_page"
+    assert len(parse_result.discovered_links) == 9
+
+
+def test_non_github_sources_do_not_use_github_noise_terms():
+    config = _make_config()
+    page = FetchedPage(
+        url="https://docs.example.com/docs/start",
+        html=(
+            "<html><body><main>"
+            "<h1>Guide</h1>"
+            "<p>" + " ".join(["content"] * 260) + "</p>"
+            "<h2>Site-wide Links</h2>"
+            "<p>Reference links in the guide</p>"
+            "</main></body></html>"
+        ),
+    )
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is not None
+    assert "Site-wide Links" in parse_result.document.content
+
+
 def test_host_specific_headers_are_applied():
     config = _make_config(
         extra_headers={
@@ -458,9 +624,11 @@ def test_host_specific_blocked_paths_do_not_affect_other_sources():
         start_paths=[],
         urls=["https://github.blog/engineering/"],
         blocked_path_substrings=["/categories/"],
+        allowed_path_prefixes=["/engineering/"],
     )
     assert not _is_allowed_url("https://blog.cloudflare.com/tag/rust/", cloudflare)
-    assert _is_allowed_url("https://github.blog/tag/rust/", github)
+    assert _is_allowed_url("https://github.blog/engineering/infrastructure/scaling-merge-ort-across-github/", github)
+    assert not _is_allowed_url("https://github.blog/tag/rust/", github)
 
 
 def test_allowed_path_prefixes_constrain_host_specific_crawls():
@@ -472,6 +640,64 @@ def test_allowed_path_prefixes_constrain_host_specific_crawls():
     )
     assert _is_allowed_url("https://www.uber.com/blog/database-federation/", uber)
     assert not _is_allowed_url("https://www.uber.com/us/en/careers/list/", uber)
+
+
+def test_source_config_combines_start_paths_with_extra_seed_urls():
+    config = _make_config(
+        start_paths=["/docs/start", "/docs/reference"],
+        extra_seed_urls=["https://docs.example.com/docs/critical-page"],
+    )
+    assert config.seed_urls == [
+        "https://docs.example.com/docs/start",
+        "https://docs.example.com/docs/reference",
+        "https://docs.example.com/docs/critical-page",
+    ]
+
+
+def test_gitlab_source_is_limited_to_eval_focused_paths():
+    gitlab = SOURCES["gitlab-handbook"]
+    assert "https://handbook.gitlab.com/handbook/engineering/devops/oncall/communication-and-culture/" in gitlab.extra_seed_urls
+    assert _is_allowed_url(
+        "https://handbook.gitlab.com/handbook/engineering/devops/oncall/communication-and-culture/",
+        gitlab,
+    )
+    assert _is_allowed_url(
+        "https://handbook.gitlab.com/handbook/product-development/how-we-work/issue-triage/",
+        gitlab,
+    )
+    assert _is_allowed_url(
+        "https://handbook.gitlab.com/handbook/values/",
+        gitlab,
+    )
+    assert not _is_allowed_url(
+        "https://handbook.gitlab.com/handbook/hiring/",
+        gitlab,
+    )
+    assert not _is_allowed_url(
+        "https://handbook.gitlab.com/handbook/people-group/time-off-and-absence/time-off-types/",
+        gitlab,
+    )
+
+
+def test_aws_waf_source_stays_inside_latest_well_architected_paths():
+    aws = SOURCES["aws-waf"]
+    assert "https://docs.aws.amazon.com/wellarchitected/latest/framework/rel-dp.html" in aws.extra_seed_urls
+    assert _is_allowed_url(
+        "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/",
+        aws,
+    )
+    assert _is_allowed_url(
+        "https://docs.aws.amazon.com/wellarchitected/latest/framework/rel-bp.html",
+        aws,
+    )
+    assert not _is_allowed_url(
+        "https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html",
+        aws,
+    )
+    assert not _is_allowed_url(
+        "https://docs.aws.amazon.com/wellarchitected/2024-06-27/framework/welcome.html",
+        aws,
+    )
 
 
 def test_netflix_certificate_error_is_classified():
@@ -503,6 +729,7 @@ def test_netflix_failure_classification_is_source_local():
         base_url=None,
         start_paths=[],
         urls=["https://github.blog/engineering/"],
+        allowed_path_prefixes=["/engineering/"],
     )
     exc = httpx.ConnectError(
         "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed",
@@ -525,9 +752,26 @@ def test_tls_fallback_context_is_source_local():
         base_url=None,
         start_paths=[],
         urls=["https://github.blog/engineering/"],
+        allowed_path_prefixes=["/engineering/"],
     )
     assert netflix.tls_fallback_strategy == "system_trust_store"
     assert _build_tls_fallback_context(github) is None
+
+
+def test_github_allowed_path_prefixes_reject_non_engineering_sections():
+    github = _make_config(
+        key="github-rfcs",
+        base_url=None,
+        start_paths=[],
+        urls=["https://github.blog/engineering/"],
+        blocked_path_substrings=["/pricing", "/login", "/account", "/tag/", "/author/", "/categories/"],
+        allowed_path_prefixes=["/engineering/"],
+    )
+    assert not _is_allowed_url("https://github.blog/changelog/2026-03-19-actions-runner-controller-release-0-14-0/", github)
+    assert not _is_allowed_url("https://github.blog/developer-skills/github/github-for-beginners-getting-started-with-github-actions/", github)
+    assert not _is_allowed_url("https://github.blog/ai-and-ml/github-copilot/how-to-debug-code-with-github-copilot/", github)
+    assert not _is_allowed_url("https://github.blog/news-insights/company-news/build-an-agent-into-any-app-with-the-github-copilot-sdk/", github)
+    assert not _is_allowed_url("https://github.blog/wp-content/uploads/2025/03/triangular-image-1.png", github)
 
 
 def test_insert_retries_after_read_error(monkeypatch):
@@ -681,6 +925,102 @@ def test_insert_fails_fast_on_non_retryable_api_error(monkeypatch):
         assert "bad request" in str(exc).lower()
     else:
         raise AssertionError("Expected APIError to be raised")
+
+
+def test_insert_splits_batch_after_repeated_transport_failure(monkeypatch):
+    inserted_payload_sizes: list[int] = []
+    attempts_by_size: dict[int, int] = {}
+
+    class DummyRequest:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def execute(self):
+            size = len(self.payload)
+            attempts_by_size[size] = attempts_by_size.get(size, 0) + 1
+            if size > 1:
+                raise httpx.ReadError("boom")
+            inserted_payload_sizes.append(size)
+            return object()
+
+    class DummyTable:
+        def insert(self, payload):
+            return DummyRequest(payload)
+
+    class DummyClient:
+        def table(self, name):
+            assert name == "corpus_chunks"
+            return DummyTable()
+
+    monkeypatch.setattr("rag.ingest._sleep_backoff", lambda attempt: asyncio.sleep(0))
+    monkeypatch.setattr("rag.ingest._get_supabase_client", lambda: DummyClient())
+    monkeypatch.setattr("rag.ingest._reset_supabase_client", lambda: DummyClient())
+
+    rows = [
+        CorpusChunkRow(
+            source_name="Docs",
+            source_url=f"https://docs.example.com/{index}",
+            section_title="Section",
+            content="Body",
+            embedding=[0.1, 0.2],
+            chunk_index=index,
+        )
+        for index in range(4)
+    ]
+
+    count = asyncio.run(_insert_chunk_rows(DummyClient(), rows))
+
+    assert count == 4
+    assert attempts_by_size[4] == 4
+    assert attempts_by_size[2] == 8
+    assert inserted_payload_sizes == [1, 1, 1, 1]
+
+
+def test_insert_does_not_split_non_retryable_api_error(monkeypatch):
+    attempts_by_size: dict[int, int] = {}
+
+    class DummyRequest:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def execute(self):
+            size = len(self.payload)
+            attempts_by_size[size] = attempts_by_size.get(size, 0) + 1
+            raise APIError({"status": 400, "message": "bad request"})
+
+    class DummyTable:
+        def insert(self, payload):
+            return DummyRequest(payload)
+
+    class DummyClient:
+        def table(self, name):
+            assert name == "corpus_chunks"
+            return DummyTable()
+
+    monkeypatch.setattr("rag.ingest._sleep_backoff", lambda attempt: asyncio.sleep(0))
+    monkeypatch.setattr("rag.ingest._get_supabase_client", lambda: DummyClient())
+    monkeypatch.setattr("rag.ingest._reset_supabase_client", lambda: DummyClient())
+
+    rows = [
+        CorpusChunkRow(
+            source_name="Docs",
+            source_url=f"https://docs.example.com/{index}",
+            section_title="Section",
+            content="Body",
+            embedding=[0.1, 0.2],
+            chunk_index=index,
+        )
+        for index in range(4)
+    ]
+
+    try:
+        asyncio.run(_insert_chunk_rows(DummyClient(), rows))
+    except APIError as exc:
+        assert "bad request" in str(exc).lower()
+    else:
+        raise AssertionError("Expected APIError to be raised")
+
+    assert attempts_by_size == {4: 1}
 
 
 def test_select_retries_after_read_error(monkeypatch):

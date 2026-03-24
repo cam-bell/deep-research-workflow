@@ -139,3 +139,138 @@ Netflix is now operational, but it is still more curated and source-specific tha
 
 ### What I learned
 I learned that “the source is blocked” and “the source is unseedable” are different problems, and it is important to separate them before deciding to replace a corpus source. I also learned that a curated article seed list can still be a real crawl if the discovered links are canonicalized and allowed to expand, but it should be documented honestly as a deliberate tradeoff rather than treated like a generic docs crawl.
+
+---
+
+## 2026-03-24 — Phase 1
+
+### Ingestion / Meta category-driven discovery
+
+### What we were trying to do
+Keep Meta as an experimental RFC/ADR source, but stop depending on a fixed list of recent article seeds. The goal was to let the crawler reach the broader archive through category pages without chunking the category listings themselves.
+
+### What happened
+The initial `meta-rfcs` implementation worked, but it started from hardcoded recent article URLs and mainly discovered the same neighborhood of linked posts. Meta category pages such as `https://engineering.fb.com/category/core-infra/` were fetchable, but under the previous parser contract a thin or listing-like page returned `None`, which meant its discovered links were effectively lost even when the HTML clearly contained article URLs.
+
+### Root cause
+The crawler was coupling “this page should become a document” with “this page can contribute discovered links.” That worked for docs-like sources, but it broke archive/category-driven sources where the useful content is in the outgoing article links rather than in the category page body.
+
+### What we changed
+We updated `/Users/cameronbell/Projects/deep-research-workflow/rag/ingest.py` to introduce `PageParseResult`, separating parsed documents from discovered links. `_parse_document(...)` now returns links even when a page is skipped for being thin or listing-like, and `ingest_source(...)` now enqueues those links regardless of whether a document was produced. We reconfigured `meta-rfcs` in `/Users/cameronbell/Projects/deep-research-workflow/rag/ingest.py` to use category seeds like `/category/core-infra/`, `/category/data-infrastructure/`, and `/category/developer-tools/`, removed `/category/` from Meta’s blocked paths, and raised Meta’s `max_pages` to `80`. We added tests in `/Users/cameronbell/Projects/deep-research-workflow/tests/test_ingest.py` to verify that listing pages can surface article links without being chunked.
+
+### Why this fix and not another
+The alternative was to keep expanding the hardcoded article seed list, but that would have turned Meta into a manually curated import instead of a crawl. Generalizing discovery from skipped listing pages solved the real architectural issue and also benefits other archive-style sources such as Cloudflare, Uber, and GitHub.
+
+### What to watch for
+The generalized behavior makes listing pages more useful, but it also increases the importance of source-specific blocklists because noisy archive pages can now feed the queue even when they are never chunked. Meta category pages currently work well, but if the site adds new taxonomy routes or tag variants, those may need to be blocked explicitly to keep discovery focused.
+
+### What I learned
+I learned that “skip this page” and “ignore this page” are not the same thing in a crawler. A listing page can be low-value as content and still be high-value as a discovery surface, and the parser contract needed to reflect that distinction.
+
+---
+
+## 2026-03-24 — Phase 1
+
+### Ingestion / Cookie and consent chrome filtering
+
+### What we were trying to do
+Clean up cookie and consent banner noise that was still leaking into crawled content despite the existing structural noise stripping. The goal was to remove common banner elements more precisely before they could become part of chunk text.
+
+### What happened
+The ingestion code already removed broad noise patterns like `nav`, `footer`, and class/id tokens containing `cookie`, but it did not explicitly target common banner selectors or `aria-label` patterns. That meant the system was resilient to some cookie markup but not all of it, and it left an unclear gap between what the crawler “usually” filtered and what it explicitly guaranteed.
+
+### Root cause
+The original noise stripping logic relied mostly on broad class/id token matching and role attributes. That covered many cases, but modern consent UI often uses more specific selectors or `aria-label` values that were not being checked directly.
+
+### What we changed
+We updated `/Users/cameronbell/Projects/deep-research-workflow/rag/ingest.py` to add `_NOISE_CLASS_ID_TOKENS` and `_NOISE_SELECTORS`, then expanded `_strip_noise()` to decompose elements matching selectors such as `.cookie-banner`, `.cookie-consent`, `#cookie-notice`, `.consent`, `#consent-banner`, `[aria-label*='cookie']`, and `[aria-label*='consent']`. We added tests in `/Users/cameronbell/Projects/deep-research-workflow/tests/test_ingest.py` to confirm those elements are removed while substantive article content remains.
+
+### Why this fix and not another
+The alternative was to push more cookie-related words into `_NOISE_SECTION_TERMS`, but that would only affect rendered text and heading selection, not DOM cleanup. We chose structural stripping because cookie and consent banners are fundamentally layout chrome, and the most reliable place to remove them is before the content renderer sees them.
+
+### What to watch for
+Selector-based stripping is more precise, but it also depends on recurring markup conventions. If a source uses a novel consent UI that does not match these selectors or token patterns, cookie noise could still leak through and would need another small rule added to `_strip_noise()`.
+
+### What I learned
+I learned that the existing “good enough” cookie filtering was too implicit. Being explicit about the selectors we mean to strip makes the ingestion behavior easier to reason about and easier to verify with tests.
+
+---
+
+## 2026-03-24 — Phase 1
+
+### Ingestion / Meta footer noise truncation
+
+### What we were trying to do
+Stop Meta article footer chrome from being chunked into the corpus. The goal was to remove trailing sections like “Share this”, “Read more in”, “Read the paper”, and “Acknowledgments” without harming the main article body.
+
+### What happened
+Meta article pages were successfully parsed, but some chunks still contained footer content that appeared after the main article text. These sections were not path-level noise and were not separate pages, so URL filters could not help. They passed through because the article container itself was substantive, which meant short footer headings at the end of the container were being rendered just like normal content.
+
+### Root cause
+The text noise terms that existed in `_NOISE_SECTION_TERMS` only affected heading selection, not content truncation. So even if a footer heading was recognized as noisy in principle, the rendered article body still continued past it.
+
+### What we changed
+We expanded `_NOISE_SECTION_TERMS` in `/Users/cameronbell/Projects/deep-research-workflow/rag/ingest.py` to include `share this`, `read more in`, `read the paper`, and `acknowledgments`. We also updated `_render_content(...)` in `/Users/cameronbell/Projects/deep-research-workflow/rag/ingest.py` so that short noise-section headings stop rendering when they appear as trailing footer boundaries inside an otherwise valid article container. We added regression coverage in `/Users/cameronbell/Projects/deep-research-workflow/tests/test_ingest.py` to confirm that these footer phrases no longer appear in parsed document content.
+
+### Why this fix and not another
+The alternative was to try to remove these sections with more CSS selectors, but the problem was not primarily structural; it was semantic. These footer sections live inside otherwise valid article containers, so the better fix was to teach the renderer where to stop once it reaches known footer boundary text.
+
+### What to watch for
+Text-based footer truncation is only as good as the phrases it recognizes. If Meta or another source changes its footer language, the cutoff terms may need to be expanded. There is also a small risk of over-truncation if a real article uses one of these phrases in a substantive heading, so future adjustments should stay conservative.
+
+### What I learned
+I learned that some ingestion problems are not about choosing the right container, but about knowing when to stop reading inside the right container. Footer chrome can survive all the structural filters if it shares the article DOM, so the renderer needs a semantic stopping point.
+
+---
+
+## 2026-03-24 — Phase 1
+
+### Ingestion / Anthropic source scope tightening
+
+### What we were trying to do
+Bring the Anthropic source back to documentation-only crawling after the broader crawler improvements made it capable of wandering into the product app. The goal was to keep Anthropic coverage high without polluting the corpus with settings, dashboard, workbench, usage, or cookbook pages.
+
+### What happened
+Once the crawler became more permissive and resilient, `anthropic-docs` started exploring routes like `https://platform.claude.com/settings/keys`, `https://platform.claude.com/workbench`, `https://platform.claude.com/dashboard`, `https://platform.claude.com/usage`, and `https://platform.claude.com/cookbook/...` during live re-ingestion. The parser and chunker were functioning, but the source boundary was now too loose for Anthropic’s mixed docs/product host.
+
+### Root cause
+Anthropic documentation and product surfaces live on the same host, and the source config was still relying mainly on start URLs plus a minimal blocklist. That was not enough once same-host discovery was enabled, because the crawler had no source-specific rule telling it to stay inside the documentation path hierarchy.
+
+### What we changed
+We updated `anthropic-docs` in `/Users/cameronbell/Projects/deep-research-workflow/rag/ingest.py` to add `allowed_path_prefixes=["/docs/en/", "/en/docs/"]` and blocked path substrings for `/settings`, `/workbench`, `/dashboard`, `/usage`, `/cost`, `/cookbook`, `/cookbooks`, and `/cdn-cgi/`. We added a source-specific test in `/Users/cameronbell/Projects/deep-research-workflow/tests/test_ingest.py` to confirm that docs URLs remain allowed while those product/account routes are rejected.
+
+### Why this fix and not another
+The alternative was to keep broad same-host crawling and add more parser-side heuristics for Anthropic app pages, but that would have mixed source definition problems with content extraction problems. We chose path constraints because Anthropic’s boundary is a source-scoping issue: the docs tree is known, stable enough to encode, and easier to maintain than trying to parse our way out of the wrong pages.
+
+### What to watch for
+Anthropic’s docs site uses redirects and some cross-host transitions from `docs.anthropic.com` back to `platform.claude.com`, so the allowed prefixes need to keep matching both URL shapes. If Anthropic changes its docs path structure later, this source config will need to be updated or the crawler could become too restrictive.
+
+### What I learned
+I learned that host-level allow rules are not enough when a vendor mixes product UI and docs on one domain. In those cases, source-specific path constraints are not optional; they are the real boundary of the corpus.
+
+---
+
+## 2026-03-24 — Phase 1
+
+### Ingestion / Supabase insert hardening for large runs
+
+### What we were trying to do
+Prevent larger ingestion runs from failing mid-stream on repeated Supabase transport errors after the first round of retry hardening had already been added. The goal was to make document inserts degrade gracefully under flaky HTTP/2/TLS behavior instead of aborting a full source run.
+
+### What happened
+A clean Anthropic re-ingest still died during a larger insert phase with repeated `httpx.ReadError: [SSL: SSLV3_ALERT_BAD_RECORD_MAC]`. The retry path fired twice, then the command exited with code `1`. This showed that the first hardening round was directionally correct but still too brittle for larger document insert batches under the current Supabase transport behavior.
+
+### Root cause
+The insert path still treated each fixed-size batch as all-or-nothing. If a retryable transport failure persisted for one batch, the system could still fail the whole document even though a smaller payload might have succeeded. The retry count and batch size helped, but they did not give the insert layer a fallback strategy when a specific batch shape remained unstable.
+
+### What we changed
+We updated `/Users/cameronbell/Projects/deep-research-workflow/rag/ingest.py` to increase `_MAX_INSERT_ATTEMPTS` from `3` to `4`, reduce `_MAX_INSERT_BATCH_SIZE` from `25` to `20`, add `_is_retryable_supabase_exception(...)`, and change `_insert_chunk_rows(...)` so retryable failing batches are recursively split into smaller sub-batches instead of aborting immediately. We added tests in `/Users/cameronbell/Projects/deep-research-workflow/tests/test_ingest.py` to verify successful batch splitting after repeated transport failures and to confirm that non-retryable `APIError` cases still fail fast without splitting.
+
+### Why this fix and not another
+The alternatives were to leave the current retries alone and keep rerunning failed ingests, or to make a more invasive transport change such as replacing the Supabase HTTP client path entirely. We chose adaptive batch splitting because it directly targets the observed failure mode with a small local change, preserves the existing Supabase architecture, and gives the insert layer a graceful fallback before more invasive work becomes necessary.
+
+### What to watch for
+Recursive splitting makes the system more robust, but it can also increase latency when a source is already under transport stress because one failing batch may turn into several smaller insert calls. If the underlying Supabase instability worsens, this strategy may still not be enough on its own and a lower-level transport change could still be needed.
+
+### What I learned
+I learned that retrying the same failing batch is not always enough; sometimes resilience requires changing the shape of the request, not just repeating it. I also learned that insert hardening needs to be tested on large, realistic source runs because that is where the transport edge cases actually show up.
