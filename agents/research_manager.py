@@ -6,7 +6,7 @@ from agents.email_agent import email_agent
 from agents.evaluator_agent import ReportEvaluation, evaluator_agent
 from agents.planner_agent import WebSearchItem, WebSearchPlan, planner_agent
 from agents.router_agent import QueryRoute, router_agent
-from agents.search_agent import search_agent
+from agents.search_agent import get_search_agent
 from agents.writer_agent import ReportData, writer_agent
 
 MAX_REVISION_ATTEMPTS = 2
@@ -189,7 +189,7 @@ class ResearchManager:
         )
         try:
             result = await Runner.run(
-                search_agent,
+                get_search_agent(),
                 search_input,
             )
             return str(result.final_output)
