@@ -90,6 +90,35 @@ def test_netflix_article_urls_are_allowed():
     )
 
 
+def test_meta_article_urls_are_allowed():
+    config = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=[
+            "https://engineering.fb.com/category/developer-tools/",
+        ],
+        blocked_path_substrings=["/author/", "/jobs", "/careers", "/videos", "/feed", "/rss"],
+    )
+    assert _is_allowed_url(
+        "https://engineering.fb.com/2026/03/09/security/how-advanced-browsing-protection-works-in-messenger/",
+        config,
+    )
+
+
+def test_meta_non_article_routes_are_rejected():
+    config = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=[
+            "https://engineering.fb.com/category/developer-tools/",
+        ],
+        blocked_path_substrings=["/author/", "/jobs", "/careers", "/videos", "/feed", "/rss"],
+    )
+    assert not _is_allowed_url("https://engineering.fb.com/author/example/", config)
+    assert not _is_allowed_url("https://engineering.fb.com/videos", config)
+    assert not _is_allowed_url("https://www.metacareers.com/jobs/123", config)
+
+
 def test_netflix_article_page_discovers_canonical_article_links():
     config = _make_config(
         base_url=None,
@@ -119,6 +148,91 @@ def test_netflix_article_page_discovers_canonical_article_links():
         "https://netflixtechblog.com/optimizing-recommendation-systems-with-jdks-vector-api-30d2830401ec",
         "https://netflixtechblog.com/mediafm-the-multimodal-ai-foundation-for-media-understanding-at-netflix-e8c28df82e2d",
     ]
+
+
+def test_meta_article_page_discovers_canonical_article_links():
+    config = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=[
+            "https://engineering.fb.com/category/developer-tools/",
+        ],
+        blocked_path_substrings=["/author/", "/jobs", "/careers", "/videos", "/feed", "/rss"],
+    )
+    paragraph = " ".join(["content"] * 260)
+    page = FetchedPage(
+        url="https://engineering.fb.com/2026/03/17/developer-tools/ranking-engineer-agent-rea-autonomous-ai-system-accelerating-meta-ads-ranking-innovation/",
+        html=(
+            "<html><body><article>"
+            "<h1>Ranking Engineer Agent</h1>"
+            f"<p>{paragraph}</p>"
+            "<a href='https://engineering.fb.com/2026/03/09/security/how-advanced-browsing-protection-works-in-messenger/'>Security</a>"
+            "<a href='https://engineering.fb.com/2026/03/02/video-engineering/ffmpeg-at-meta-media-processing-at-scale/'>Video</a>"
+            "<a href='https://engineering.fb.com/category/security/'>Category</a>"
+            "<a href='https://engineering.fb.com/author/example/'>Author</a>"
+            "<a href='https://www.metacareers.com/jobs/123'>Jobs</a>"
+            "</article></body></html>"
+        ),
+    )
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is not None
+    assert parse_result.discovered_links == [
+        "https://engineering.fb.com/2026/03/09/security/how-advanced-browsing-protection-works-in-messenger",
+        "https://engineering.fb.com/2026/03/02/video-engineering/ffmpeg-at-meta-media-processing-at-scale",
+        "https://engineering.fb.com/category/security",
+    ]
+
+
+def test_listing_page_returns_links_even_when_not_chunked():
+    config = _make_config()
+    links = "".join(
+        f"<li><a href='/docs/article-{index}'>Article {index}</a></li>"
+        for index in range(20)
+    )
+    page = FetchedPage(
+        url="https://docs.example.com/docs/start",
+        html=(
+            "<html><body><main><h1>Engineering</h1>"
+            "<p>" + " ".join(["summary"] * 220) + "</p>"
+            f"<ul>{links}</ul>"
+            "</main></body></html>"
+        ),
+    )
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is None
+    assert parse_result.skip_reason == "listing_page"
+    assert len(parse_result.discovered_links) == 20
+
+
+def test_meta_category_page_returns_article_links_without_chunking():
+    config = _make_config(
+        base_url=None,
+        start_paths=[],
+        urls=["https://engineering.fb.com/category/developer-tools/"],
+        blocked_path_substrings=["/author/", "/jobs", "/careers", "/videos", "/feed", "/rss"],
+    )
+    page = FetchedPage(
+        url="https://engineering.fb.com/category/developer-tools/",
+        html=(
+            "<html><body><main><h1>Developer Tools</h1>"
+            "<p>" + " ".join(["summary"] * 220) + "</p>"
+            "<a href='https://engineering.fb.com/2026/03/17/developer-tools/ranking-engineer-agent-rea-autonomous-ai-system-accelerating-meta-ads-ranking-innovation/'>REA</a>"
+            "<a href='https://engineering.fb.com/2026/02/11/developer-tools/the-death-of-traditional-testing-agentic-development-jit-testing-revival/'>Testing</a>"
+            "<a href='https://engineering.fb.com/category/security/'>Category</a>"
+            "<a href='https://engineering.fb.com/author/example/'>Author</a>"
+            "<a href='https://www.metacareers.com/jobs/123'>Jobs</a>"
+            + "".join(
+                f"<a href='https://engineering.fb.com/2026/01/{index:02d}/developer-tools/tool-{index}/'>Tool {index}</a>"
+                for index in range(1, 15)
+            )
+            + "</main></body></html>"
+        ),
+    )
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is None
+    assert parse_result.skip_reason == "listing_page"
+    assert "https://engineering.fb.com/2026/03/17/developer-tools/ranking-engineer-agent-rea-autonomous-ai-system-accelerating-meta-ads-ranking-innovation" in parse_result.discovered_links
+    assert "https://engineering.fb.com/category/security" in parse_result.discovered_links
 
 
 def test_allowed_redirect_host_is_accepted():
@@ -194,13 +308,43 @@ def test_strip_noise_handles_malformed_attrs():
     _strip_noise(container)
 
 
+def test_strip_noise_removes_cookie_and_consent_selectors():
+    soup = BeautifulSoup(
+        (
+            "<main>"
+            "<div class='cookie-banner'>Cookie banner</div>"
+            "<div id='cookie-notice'>Cookie notice</div>"
+            "<div class='consent'>Consent text</div>"
+            "<div id='consent-banner'>Consent banner</div>"
+            "<div aria-label='cookie preferences'>Cookie preferences</div>"
+            "<article>Real content</article>"
+            "</main>"
+        ),
+        "html.parser",
+    )
+    container = soup.main
+    assert container is not None
+
+    _strip_noise(container)
+
+    text = container.get_text(" ", strip=True)
+    assert "Cookie banner" not in text
+    assert "Cookie notice" not in text
+    assert "Consent text" not in text
+    assert "Consent banner" not in text
+    assert "Cookie preferences" not in text
+    assert "Real content" in text
+
+
 def test_parse_document_skips_thin_page():
     config = _make_config()
     page = FetchedPage(
         url="https://docs.example.com/docs/start",
         html="<html><body><main><h1>Title</h1><p>Too short.</p></main></body></html>",
     )
-    assert _parse_document(page, config) is None
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is None
+    assert parse_result.skip_reason == "thin_page"
 
 
 def test_parse_document_keeps_substantive_page():
@@ -210,9 +354,30 @@ def test_parse_document_keeps_substantive_page():
         url="https://docs.example.com/docs/start",
         html=f"<html><body><main><h1>Guide</h1><p>{paragraph}</p></main></body></html>",
     )
-    document = _parse_document(page, config)
-    assert document is not None
-    assert document.section_title == "Guide"
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is not None
+    assert parse_result.document.section_title == "Guide"
+
+
+def test_parse_document_truncates_at_noise_section_terms():
+    config = _make_config()
+    page = FetchedPage(
+        url="https://docs.example.com/docs/start",
+        html=(
+            "<html><body><main>"
+            "<h1>Meta article</h1>"
+            "<p>" + " ".join(["content"] * 260) + "</p>"
+            "<h2>Share this</h2>"
+            "<p>Read More in Security</p>"
+            "<p>Acknowledgments</p>"
+            "</main></body></html>"
+        ),
+    )
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is not None
+    assert "Share this" not in parse_result.document.content
+    assert "Read More in Security" not in parse_result.document.content
+    assert "Acknowledgments" not in parse_result.document.content
 
 
 def test_parse_document_uses_role_main_container():
@@ -222,9 +387,9 @@ def test_parse_document_uses_role_main_container():
         url="https://docs.example.com/docs/start",
         html=f"<html><body><div role='main'><h1>Guide</h1><p>{paragraph}</p></div></body></html>",
     )
-    document = _parse_document(page, config)
-    assert document is not None
-    assert document.section_title == "Guide"
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is not None
+    assert parse_result.document.section_title == "Guide"
 
 
 def test_listing_like_pages_are_skipped():
@@ -242,7 +407,10 @@ def test_listing_like_pages_are_skipped():
             "</main></body></html>"
         ),
     )
-    assert _parse_document(page, config) is None
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is None
+    assert parse_result.skip_reason == "listing_page"
+    assert len(parse_result.discovered_links) == 20
 
 
 def test_article_like_pages_are_kept_even_with_links():
@@ -260,9 +428,9 @@ def test_article_like_pages_are_kept_even_with_links():
             "</main></body></html>"
         ),
     )
-    document = _parse_document(page, config)
-    assert document is not None
-    assert document.section_title == "Engineering"
+    parse_result = _parse_document(page, config)
+    assert parse_result.document is not None
+    assert parse_result.document.section_title == "Engineering"
 
 
 def test_host_specific_headers_are_applied():
@@ -679,8 +847,8 @@ def test_fetch_uses_tls_fallback_and_succeeds(monkeypatch):
         )
         page = await _fetch_page(client, "https://netflixtechblog.com/", robots, config)
         assert page is not None
-        document = _parse_document(page, config)
-        assert document is not None
-        assert document.section_title == "Netflix Incident Review"
+        parse_result = _parse_document(page, config)
+        assert parse_result.document is not None
+        assert parse_result.document.section_title == "Netflix Incident Review"
 
     asyncio.run(run_test())

@@ -84,7 +84,34 @@ _DEFAULT_BLOCKED_PATH_SUBSTRINGS = (
     "/newsletter",
     "/account",
 )
-_NOISE_SECTION_TERMS = ("cookie", "privacy", "consent", "preferences")
+_NOISE_SECTION_TERMS = (
+    "cookie",
+    "privacy",
+    "consent",
+    "preferences",
+    "share this",
+    "read more in",
+    "read the paper",
+    "acknowledgments",
+)
+_NOISE_CLASS_ID_TOKENS = (
+    "nav",
+    "footer",
+    "sidebar",
+    "cookie",
+    "consent",
+    "advert",
+    "promo",
+)
+_NOISE_SELECTORS = (
+    ".cookie-banner",
+    ".cookie-consent",
+    "#cookie-notice",
+    ".consent",
+    "#consent-banner",
+    "[aria-label*='cookie']",
+    "[aria-label*='consent']",
+)
 _supabase_client: Client | None = None
 
 
@@ -144,6 +171,12 @@ class ParsedDocument(BaseModel):
     section_title: str
     content: str
     discovered_links: list[str]
+
+
+class PageParseResult(BaseModel):
+    document: ParsedDocument | None
+    discovered_links: list[str]
+    skip_reason: str | None = None
 
 
 class CorpusChunkRow(BaseModel):
@@ -301,6 +334,31 @@ SOURCES: dict[str, SourceConfig] = {
         max_pages=50,
         blocked_path_substrings=["/pricing", "/login", "/account", "/tag/", "/author/", "/categories/"],
     ),
+    "meta-rfcs": SourceConfig(
+        key="meta-rfcs",
+        urls=[
+            "https://engineering.fb.com/category/core-infra/",
+            "https://engineering.fb.com/category/data-infrastructure/",
+            "https://engineering.fb.com/category/developer-tools/",
+            "https://engineering.fb.com/category/production-engineering/",
+            "https://engineering.fb.com/category/security/",
+            "https://engineering.fb.com/category/ml-applications/",
+            "https://engineering.fb.com/category/web/",
+        ],
+        source_name="Engineering RFCs and ADRs (Meta)",
+        max_pages=80,
+        blocked_path_substrings=[
+            "/careers",
+            "/jobs",
+            "/watch-videos",
+            "/videos",
+            "/feed",
+            "/search",
+            "/privacy",
+            "/author/",
+            "/rss",
+        ],
+    ),
 }
 
 
@@ -411,16 +469,24 @@ def _strip_noise(container: Tag) -> None:
     for tag in list(container.find_all(_BLOCKED_TAGS)):
         tag.decompose()
 
+    for selector in _NOISE_SELECTORS:
+        for element in list(container.select(selector)):
+            element.decompose()
+
     noisy_selectors = (
         lambda element: any(
             token in " ".join(_class_tokens(element)).lower()
-            for token in ("nav", "footer", "sidebar", "cookie", "advert", "promo")
+            for token in _NOISE_CLASS_ID_TOKENS
         ),
         lambda element: any(
             token in _id_value(element).lower()
-            for token in ("nav", "footer", "sidebar", "cookie", "advert", "promo")
+            for token in _NOISE_CLASS_ID_TOKENS
         ),
         lambda element: _attr_value(element, "role") in {"navigation", "banner", "complementary"},
+        lambda element: any(
+            token in _attr_value(element, "aria-label").lower()
+            for token in ("cookie", "consent")
+        ),
     )
 
     for element in list(container.find_all(True)):
@@ -476,6 +542,8 @@ def _render_content(container: Tag) -> tuple[str, str]:
         text = node.get_text("\n" if node.name == "pre" else " ", strip=True)
         if not text:
             continue
+        if _is_noise_section_text(text) and _word_count(text) <= 12:
+            break
         if node.name and node.name.startswith("h") and node.name[1:].isdigit():
             heading_level = int(node.name[1])
             rendered = f"{'#' * heading_level} {text}"
@@ -524,7 +592,7 @@ def _extract_links(container: Tag, current_url: str, config: SourceConfig) -> li
     return discovered_links
 
 
-def _parse_document(page: FetchedPage, config: SourceConfig) -> ParsedDocument | None:
+def _parse_document(page: FetchedPage, config: SourceConfig) -> PageParseResult:
     soup = BeautifulSoup(page.html, "html.parser")
     page_title = ""
     if soup.title and soup.title.string:
@@ -532,6 +600,8 @@ def _parse_document(page: FetchedPage, config: SourceConfig) -> ParsedDocument |
 
     best_document: ParsedDocument | None = None
     best_length = 0
+    discovered_links: list[str] = []
+    skip_reason: str | None = "no_content"
 
     for candidate in _candidate_containers(soup):
         candidate_soup = BeautifulSoup(str(candidate), "html.parser")
@@ -540,13 +610,17 @@ def _parse_document(page: FetchedPage, config: SourceConfig) -> ParsedDocument |
             continue
 
         _strip_noise(container)
+        candidate_links = _extract_links(container, page.url, config)
+        if len(candidate_links) > len(discovered_links):
+            discovered_links = candidate_links
         content, first_heading = _render_content(container)
         if _word_count(content) < _MIN_CONTENT_WORDS:
+            skip_reason = "thin_page"
             continue
 
         section_title = first_heading or page_title or config.source_name
-        discovered_links = _extract_links(container, page.url, config)
-        if _is_listing_like_page(content, discovered_links):
+        if _is_listing_like_page(content, candidate_links):
+            skip_reason = "listing_page"
             continue
 
         document = ParsedDocument(
@@ -554,13 +628,19 @@ def _parse_document(page: FetchedPage, config: SourceConfig) -> ParsedDocument |
             source_url=page.url,
             section_title=section_title,
             content=content,
-            discovered_links=discovered_links,
+            discovered_links=candidate_links,
         )
         if len(document.content) > best_length:
             best_document = document
             best_length = len(document.content)
+            discovered_links = candidate_links
+            skip_reason = None
 
-    return best_document
+    return PageParseResult(
+        document=best_document,
+        discovered_links=discovered_links,
+        skip_reason=skip_reason,
+    )
 
 
 def _redirect_chain_hosts(requested_url: str, response: httpx.Response) -> list[str]:
@@ -909,19 +989,21 @@ async def ingest_source(
                 stats.pages_skipped += 1
                 continue
 
-            document = _parse_document(page, config)
-            if document is None:
-                stats.pages_skipped += 1
-                continue
-
-            stats.pages_fetched += 1
-            for link in document.discovered_links:
+            parse_result = _parse_document(page, config)
+            for link in parse_result.discovered_links:
                 if link in seen or not _is_allowed_url(link, config):
                     continue
                 if len(seen) >= page_limit * 20:
                     continue
                 seen.add(link)
                 queue.append(link)
+
+            document = parse_result.document
+            if document is None:
+                stats.pages_skipped += 1
+                continue
+
+            stats.pages_fetched += 1
 
             await _ingest_document(supabase_client, document, stats)
             logger.info(
