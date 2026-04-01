@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 from agents import Runner, gen_trace_id, trace
 from agents.clarify_agent import ClarifyingQuestion, clarify_agent
@@ -6,7 +7,7 @@ from agents.email_agent import email_agent
 from agents.evaluator_agent import ReportEvaluation, evaluator_agent
 from agents.planner_agent import WebSearchItem, WebSearchPlan, planner_agent
 from agents.router_agent import QueryRoute, router_agent
-from agents.search_agent import search_agent
+from agents.search_agent import search_agent, tavily_search_agent
 from agents.writer_agent import ReportData, writer_agent
 
 MAX_REVISION_ATTEMPTS = 2
@@ -183,13 +184,15 @@ class ResearchManager:
 
     async def search(self, item: WebSearchItem) -> str | None:
         """Perform a search for the query"""
+        provider = os.environ.get("SEARCH_PROVIDER", "openai").lower()
+        agent = tavily_search_agent if provider == "tavily" else search_agent
         search_input = (
             f"Search term: {item.query}\n"
             f"Reason for searching: {item.reason}"
         )
         try:
             result = await Runner.run(
-                search_agent,
+                agent,
                 search_input,
             )
             return str(result.final_output)
