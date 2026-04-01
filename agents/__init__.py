@@ -35,4 +35,5 @@ function_tool = _sdk.function_tool
 gen_trace_id = _sdk.gen_trace_id
 trace = _sdk.trace
 
+from agents.search_agent import tavily_search_agent
 from agents.research_manager import ResearchManager

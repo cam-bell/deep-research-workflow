@@ -183,6 +183,8 @@ LANGFUSE_SECRET_KEY=
 LANGFUSE_HOST=            # https://cloud.langfuse.com
 JWT_SECRET=               # random 32-char string
 SENDGRID_API_KEY=         # existing, already in use by email_agent
+TAVILY_API_KEY=           # required when SEARCH_PROVIDER=tavily
+SEARCH_PROVIDER=          # optional: "openai" (default) or "tavily"
 ```
 
 In CI/CD: set all of the above as GitHub Secrets. They are referenced
